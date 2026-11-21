@@ -1,0 +1,15 @@
+__pycache__/
+*.py[cod]
+.venv/
+build/
+dist/
+data/
+base/
+mods/
+tools/phase0_work/
+native/pak_enabler/build/
+*.spec
+*.zip
+*.dll
+*.exe
+*.log
