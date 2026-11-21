@@ -7,6 +7,7 @@ import locale
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -114,12 +115,17 @@ class LinuxPlatform(Platform):
         apps = Path.home() / ".local" / "share" / "applications"
         apps.mkdir(parents=True, exist_ok=True)
         desktop = apps / "wmm-nxm.desktop"
+        exec_line = (
+            f'Exec="{wmm_exe}" cli nxm %u\n'
+            if getattr(sys, "frozen", False)
+            else f'Exec="{wmm_exe}" -m wmm cli nxm %u\n'
+        )
         desktop.write_text(
             "[Desktop Entry]\n"
             "Type=Application\n"
             "Name=Wuchang Mod Manager\n"
-            f'Exec="{wmm_exe}" cli nxm %u\n'
-            "MimeType=x-scheme-handler/nxm;\n"
+            + exec_line
+            + "MimeType=x-scheme-handler/nxm;\n"
             "NoDisplay=true\n",
             encoding="utf-8",
             newline="\n",

@@ -385,6 +385,56 @@ def cmd_play(args: argparse.Namespace, store: Store, t: Translator) -> int:
     return 0
 
 
+NXM_IPC_SERVER_NAME = "WuchangModManager_IPC_v1"
+
+
+def _send_nxm_to_running_instance(uri: str) -> bool:
+    """Try forwarding an nxm:// URI to an already-running WMM GUI via QLocalSocket."""
+    try:
+        from PySide6.QtNetwork import QLocalSocket
+        sock = QLocalSocket()
+        sock.connectToServer(NXM_IPC_SERVER_NAME)
+        if not sock.waitForConnected(400):
+            return False
+        sock.write((uri + "\n").encode("utf-8"))
+        sock.flush()
+        sock.waitForBytesWritten(1000)
+        sock.disconnectFromServer()
+        return True
+    except Exception:
+        return False
+
+
+def cmd_nxm(args: argparse.Namespace, store: Store, t: Translator) -> int:
+    """Handle an nxm:// URI from Nexus 'Mod Manager Download'."""
+    from .nexus import DEFAULT_GAME_DOMAIN, NexusError, parse_nxm_uri
+
+    uri = args.uri.strip()
+    try:
+        link = parse_nxm_uri(uri)
+    except NexusError as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 2
+
+    # Forward links for other games to the previous handler (Vortex / MO2) if saved
+    if link.domain.lower() != DEFAULT_GAME_DOMAIN:
+        prev = store.load_settings().get("nxm_previous_handler", "")
+        if prev:
+            cmd = prev.replace("%1", uri).replace("%u", uri)
+            subprocess.Popen(cmd, shell=True)
+            return 0
+        print(f"Ignored nxm:// link for other game: {link.domain}", file=sys.stderr)
+        return 0
+
+    # If WMM GUI is already open, hand the URI to it directly
+    if _send_nxm_to_running_instance(uri):
+        return 0
+
+    # Otherwise launch WMM GUI and immediately download/add the mod
+    from .ui import launch_gui
+    return launch_gui(data_dir=store.data_dir, initial_nxm_uri=uri)
+
+
 def cmd_launch(args: argparse.Namespace, store: Store, t: Translator) -> int:
     """Steam Launch Options wrapper: apply active WMM profile, then run the game command."""
     game = _resolve_game(store, args.game)
@@ -460,6 +510,8 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("lang-template", help="Sync lang/en.json from tr() calls in source")
 
     sub.add_parser("play", help="Apply active profile and launch the game directly")
+    sp_nxm = sub.add_parser("nxm", help="Handle an nxm:// Mod Manager Download URI")
+    sp_nxm.add_argument("uri", help="nxm:// URI")
     sp_launch = sub.add_parser("launch", help="Apply active profile then exec game command (for Steam Launch Options)")
     sp_launch.add_argument("cmd", nargs=argparse.REMAINDER, help="Command passed by Steam (after --)")
 
@@ -500,6 +552,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         "adopt": cmd_adopt,
         "remove-all": cmd_remove_all,
         "play": cmd_play,
+        "nxm": cmd_nxm,
         "launch": cmd_launch,
         "lang-template": cmd_lang_template,
     }

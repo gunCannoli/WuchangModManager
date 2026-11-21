@@ -81,8 +81,8 @@ class TestEngineIni(unittest.TestCase):
             self.assertEqual(read_perf_preset_mode(ini), "vrr")
             self.assertIn("r.D3D12.UseAllowTearing=1", ini.read_text(encoding="utf-8"))
 
-            apply_perf_preset(ini, "no_vrr")
-            self.assertEqual(read_perf_preset_mode(ini), "no_vrr")
+            apply_perf_preset(ini, "default")
+            self.assertEqual(read_perf_preset_mode(ini), "default")
             self.assertNotIn("r.D3D12.UseAllowTearing=1", ini.read_text(encoding="utf-8"))
             self.assertIn("r.ShaderPipelineCache.Enabled=1", ini.read_text(encoding="utf-8"))
 

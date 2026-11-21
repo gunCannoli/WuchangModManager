@@ -129,8 +129,8 @@ class OnboardingDialog(QDialog):
         self.row_ini, self.badge_ini, self.lbl_ini, b_ini = self._make_row(self.t.tr("onboarding.step_ini"))
         self.combo_perf = QComboBox()
         self.combo_perf.addItem(self.t.tr("onboarding.perf_none"), "none")
+        self.combo_perf.addItem(self.t.tr("onboarding.perf_default"), "default")
         self.combo_perf.addItem(self.t.tr("onboarding.perf_vrr"), "vrr")
-        self.combo_perf.addItem(self.t.tr("onboarding.perf_no_vrr"), "no_vrr")
         self.btn_apply_ini = QPushButton(self.t.tr("btn.apply"))
         self.btn_apply_ini.clicked.connect(self._apply_ini_step)
         self.btn_start_once = QPushButton(self.t.tr("btn.start_game"))
@@ -228,7 +228,7 @@ class OnboardingDialog(QDialog):
                 self.combo_perf.blockSignals(True)
                 self.combo_perf.setCurrentIndex(idx)
                 self.combo_perf.blockSignals(False)
-            mode_str = {"vrr": "VRR", "no_vrr": "No VRR", "none": "Off"}[cur_mode]
+            mode_str = {"vrr": "VRR", "default": "Default", "none": "Off"}[cur_mode]
             self.lbl_ini.setText(self.t.tr("onboarding.ini_found_preset", preset=mode_str))
             self.combo_perf.setVisible(True)
             self.btn_apply_ini.setVisible(True)

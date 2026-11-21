@@ -13,8 +13,13 @@ def _app_root() -> Path:
     return Path(__file__).resolve().parent.parent.parent
 
 
-def launch_gui(data_dir: Optional[Path] = None, game_override: Optional[Path] = None) -> int:
+def launch_gui(
+    data_dir: Optional[Path] = None,
+    game_override: Optional[Path] = None,
+    initial_nxm_uri: Optional[str] = None,
+) -> int:
     """Launch the PySide6 WMM main window (exits cleanly if initial onboarding is closed)."""
+    from PySide6.QtCore import QTimer
     from PySide6.QtGui import QIcon
     from PySide6.QtWidgets import QApplication, QDialog
 
@@ -57,4 +62,6 @@ def launch_gui(data_dir: Optional[Path] = None, game_override: Optional[Path] = 
         run_onboarding_if_needed=False,
     )
     win.show()
+    if initial_nxm_uri:
+        QTimer.singleShot(150, lambda: win.handle_nxm_uri(initial_nxm_uri))
     return app.exec()

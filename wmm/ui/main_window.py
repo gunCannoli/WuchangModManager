@@ -11,6 +11,7 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent
+from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QComboBox,
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..cli import NXM_IPC_SERVER_NAME
 from ..deploy import DeployError, Manager, UnmanagedMod, scan_unmanaged_mods
 from ..extract import ExtractError
 from ..game import GameInstall, detect_all_installs, running_game_processes, validate_game_root
@@ -43,6 +45,33 @@ from ..platform import get_platform
 from ..store import ModRecord, Profile, Store
 from .onboarding import OnboardingDialog
 from .settings_dialog import SettingsDialog
+
+
+class _ResponsiveModTable(QTableWidget):
+    """Mod table where all data columns are user-resizable and 'Name' fills remaining width."""
+
+    def __init__(self, rows: int, cols: int, parent: Optional[QWidget] = None):
+        super().__init__(rows, cols, parent)
+        self._adjusting = False
+
+    def fit_name_column(self) -> None:
+        if self._adjusting:
+            return
+        avail = self.viewport().width()
+        if avail <= 0:
+            return
+        self._adjusting = True
+        try:
+            other = sum(self.columnWidth(c) for c in range(self.columnCount()) if c != 1)
+            target_name = max(140, avail - other)
+            if self.columnWidth(1) != target_name:
+                self.setColumnWidth(1, target_name)
+        finally:
+            self._adjusting = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.fit_name_column()
 
 
 class LogDialog(QDialog):
@@ -88,11 +117,38 @@ class MainWindow(QMainWindow):
         self._build_toolbar()
         self._build_body()
         self.setStatusBar(QStatusBar())
+        self._start_nxm_ipc_server()
 
         if run_onboarding_if_needed and (self.game is None or not settings.get("onboarded", False)):
             self._open_onboarding()
 
         self.refresh_all()
+
+    def _start_nxm_ipc_server(self) -> None:
+        self._ipc_server = QLocalServer(self)
+        QLocalServer.removeServer(NXM_IPC_SERVER_NAME)
+        if self._ipc_server.listen(NXM_IPC_SERVER_NAME):
+            self._ipc_server.newConnection.connect(self._on_ipc_connection)
+
+    def _on_ipc_connection(self) -> None:
+        while self._ipc_server.hasPendingConnections():
+            sock = self._ipc_server.nextPendingConnection()
+            if sock is None:
+                continue
+            if sock.waitForReadyRead(500):
+                raw = bytes(sock.readAll()).decode("utf-8", errors="ignore").strip()
+                if raw:
+                    for line in raw.splitlines():
+                        if line.strip().lower().startswith("nxm://"):
+                            self.raise_()
+                            self.activateWindow()
+                            self.handle_nxm_uri(line.strip())
+            sock.disconnectFromServer()
+
+    def closeEvent(self, event) -> None:
+        if hasattr(self, "_ipc_server") and self._ipc_server.isListening():
+            self._ipc_server.close()
+        super().closeEvent(event)
 
     def _log(self, msg: str) -> None:
         self.logs.append(msg)
@@ -160,7 +216,7 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
         # Mod table: [On, Name, Type, Version, Priority, Status]
-        self.table = QTableWidget(0, 6)
+        self.table = _ResponsiveModTable(0, 6)
         self.table.setHorizontalHeaderLabels(
             [
                 "",
@@ -182,13 +238,13 @@ class MainWindow(QMainWindow):
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
 
         hdr = self.table.horizontalHeader()
+        hdr.setStretchLastSection(False)
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.setColumnWidth(0, 34)
-        hdr.setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        hdr.setSectionResizeMode(2, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(3, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(4, QHeaderView.ResizeMode.ResizeToContents)
-        hdr.setSectionResizeMode(5, QHeaderView.ResizeMode.ResizeToContents)
+        self.table.setColumnWidth(0, 32)
+        for col, width in ((1, 240), (2, 85), (3, 70), (4, 65), (5, 105)):
+            hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
+            self.table.setColumnWidth(col, width)
+        hdr.sectionResized.connect(self._on_header_resized)
 
         # Details pane
         details_box = QWidget()
@@ -205,7 +261,12 @@ class MainWindow(QMainWindow):
         splitter.addWidget(details_box)
         splitter.setStretchFactor(0, 3)
         splitter.setStretchFactor(1, 2)
+        splitter.splitterMoved.connect(lambda *_: self.table.fit_name_column())
         self.setCentralWidget(splitter)
+
+    def _on_header_resized(self, logical_index: int, _old: int, _new: int) -> None:
+        if logical_index != 1:
+            self.table.fit_name_column()
 
     # --- Refresh & state rendering ---
 
@@ -469,10 +530,8 @@ class MainWindow(QMainWindow):
         if chosen:
             self._install_path(Path(chosen))
 
-    def _on_download(self) -> None:
-        uri, ok = QInputDialog.getText(self, self.t.tr("btn.download"), self.t.tr("download.prompt"))
-        if not ok or not uri.strip():
-            return
+    def handle_nxm_uri(self, uri: str) -> None:
+        """Download and install a mod from an nxm:// or https:// URL."""
         uri = uri.strip()
         settings = self.store.load_settings()
         raw_key = settings.get("nexus_api_key", "")
@@ -481,6 +540,9 @@ class MainWindow(QMainWindow):
         dl_dir = Path(mods_dir_raw) if mods_dir_raw else self.store.downloads_dir
         try:
             if uri.lower().startswith("nxm://"):
+                if not api_key:
+                    QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("download.need_api_key"))
+                    return
                 link = parse_nxm_uri(uri)
                 client = NexusClient(api_key)
                 links = client.get_download_links(
@@ -498,6 +560,12 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("download.invalid_url"))
         except Exception as exc:
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+
+    def _on_download(self) -> None:
+        uri, ok = QInputDialog.getText(self, self.t.tr("btn.download"), self.t.tr("download.prompt"))
+        if not ok or not uri.strip():
+            return
+        self.handle_nxm_uri(uri.strip())
 
     def _on_play(self) -> None:
         mgr = self._manager()

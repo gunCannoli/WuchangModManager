@@ -9,6 +9,7 @@ import locale
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Optional
 
@@ -196,7 +197,13 @@ class WindowsPlatform(Platform):
             winreg.SetValueEx(k, "", 0, winreg.REG_SZ, "URL:Nexus Mod Manager Protocol")
             winreg.SetValueEx(k, "URL Protocol", 0, winreg.REG_SZ, "")
         with winreg.CreateKey(winreg.HKEY_CURRENT_USER, cmd_key) as k:
-            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, f'"{wmm_exe}" cli nxm "%1"')
+            if getattr(sys, "frozen", False):
+                cmd_val = f'"{wmm_exe}" cli nxm "%1"'
+            else:
+                pyw = wmm_exe.with_name("pythonw.exe")
+                exe_use = pyw if pyw.is_file() else wmm_exe
+                cmd_val = f'"{exe_use}" -m wmm cli nxm "%1"'
+            winreg.SetValueEx(k, "", 0, winreg.REG_SZ, cmd_val)
         return prev
 
     def unregister_nxm(self, previous_handler: Optional[str] = None) -> None:

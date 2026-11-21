@@ -12,8 +12,9 @@ WMM_BP_SECTION = "/Game/Mods/WMM_BPLoader/WBP_WMM_BPLoader.WBP_WMM_BPLoader_C"
 WFF_BP_SECTION = "/Game/Mods/WFF_BPLoader/WBP_WFF_BPLoader.WBP_WFF_BPLoader_C"
 PERF_BLOCK_ID = "perf_preset"
 
-# Clean, UE 5.1-safe performance preset (PSO/shader hitch reduction, async texture streaming,
-# D3D12 stability). Applied inside reversible WMM-BEGIN/WMM-END markers.
+# Clean, UE 5.1-safe performance-only preset (zero visual/post-process/sharpness changes:
+# shader pipeline cache, async texture streaming, thread sync, D3D12 stability, GC interval).
+# Applied inside reversible WMM-BEGIN/WMM-END markers.
 _PERF_COMMON = """[SystemSettings]
 r.CreateShadersOnLoad=1
 r.ShaderPipelineCache.Enabled=1
@@ -28,13 +29,14 @@ r.D3D12.GPUTimeout=0
 gc.TimeBetweenPurgingPendingKillObjects=60
 """
 
-PERF_PRESET_NO_VRR = (
-    "; WMM UE 5.1 Performance Preset (No VRR)\n"
+PERF_PRESET_DEFAULT = (
+    "; WMM UE 5.1 Performance Preset (Default — performance only, no visual changes)\n"
     + _PERF_COMMON
 )
+PERF_PRESET_NO_VRR = PERF_PRESET_DEFAULT  # backward-compatible alias
 
 PERF_PRESET_VRR = (
-    "; WMM UE 5.1 Performance Preset (VRR / G-Sync / FreeSync)\n"
+    "; WMM UE 5.1 Performance Preset (VRR / G-Sync / FreeSync — performance only, no visual changes)\n"
     + _PERF_COMMON
     + "r.VSync=0\n"
     + "r.D3D12.UseAllowTearing=1\n"
@@ -234,7 +236,7 @@ def apply_ini_tweak_block(
 
 
 def read_perf_preset_mode(ini_path: Path) -> str:
-    """Return 'vrr', 'no_vrr', or 'none' based on existing WMM perf_preset block in Engine.ini."""
+    """Return 'vrr', 'default', or 'none' based on existing WMM perf_preset block in Engine.ini."""
     if not ini_path.is_file():
         return "none"
     raw = ini_path.read_bytes()
@@ -245,15 +247,15 @@ def read_perf_preset_mode(ini_path: Path) -> str:
         return "none"
     if "r.D3D12.UseAllowTearing=1" in text:
         return "vrr"
-    return "no_vrr"
+    return "default"
 
 
 def apply_perf_preset(ini_path: Path, mode: str, backup_dir: Optional[Path] = None) -> Path:
-    """Apply ('vrr', 'no_vrr') or remove ('none') WMM's UE 5.1 performance preset in Engine.ini."""
+    """Apply ('default', 'vrr') or remove ('none') WMM's UE 5.1 performance-only preset in Engine.ini."""
     if mode == "vrr":
         block = PERF_PRESET_VRR
-    elif mode == "no_vrr":
-        block = PERF_PRESET_NO_VRR
+    elif mode in ("default", "no_vrr"):
+        block = PERF_PRESET_DEFAULT
     else:
         block = None
     return apply_ini_tweak_block(ini_path, PERF_BLOCK_ID, block, backup_dir=backup_dir)
