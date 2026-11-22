@@ -2,7 +2,9 @@
 
 All notable changes to **Wuchang Mod Manager (WMM)** are documented here.
 
-## Unreleased (post v0.1.0-beta)
+## v0.5.0-beta (2026-11-22)
+
+- Settings: the *Show UE4SS core mods* and *Handle nxm:// links* checkboxes now line up on the left with the others.
 
 ### UI & Profiles
 - Added a centered running-game lock modal (`WMM is locked while the game is running`) with a manual **Unlock** button; background `nxm://` downloads continue while locked, the lock auto-closes when the game exits, and enabling mods while unlocked alerts that changes apply after restarting the game.

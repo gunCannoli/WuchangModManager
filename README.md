@@ -20,7 +20,7 @@ Zero installer, zero duplicate mod copies, and zero edits to your game executabl
 
 ## Quick Start
 
-1. Download **`WuchangModManager_v0.1.0_portable.zip`** and extract it anywhere (e.g. `D:\WMM\`).
+1. Download **`WuchangModManager_v0.5.0_portable.zip`** and extract it anywhere (e.g. `D:\WMM\`).
 2. *(Optional, for UE4SS mods)* Download **`WMM_Custom_UE4SS.zip`** and drop it into the `WMM\` folder (or your chosen Mods folder).
 3. Run **`WMM.exe`** and complete the setup screen.
 
