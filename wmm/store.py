@@ -131,7 +131,8 @@ class Store:
                 "mods_archive_dir": "",
                 "language": "en",
                 "nexus_api_key": "",
-                "keep_archives": False,
+                "auto_extract": False,
+                "keep_archives": True,
                 "active_profile": "default",
                 "aes_key": "",
                 "pak_order_rules": {},
@@ -223,6 +224,27 @@ class Store:
             return ["default"]
         names = [p.stem for p in sorted(self.profiles_dir.glob("*.json"))]
         return names or ["default"]
+
+    def clone_profile(self, source_name: str, new_name: str) -> Profile:
+        src = self.load_profile(source_name)
+        cloned = Profile(
+            name=new_name,
+            enabled_mods=list(src.enabled_mods),
+            pak_order=list(src.pak_order),
+            ue4ss_order=list(src.ue4ss_order),
+        )
+        self.save_profile(cloned)
+        return cloned
+
+    def delete_profile(self, name: str) -> bool:
+        profiles = self.list_profiles()
+        if len(profiles) <= 1:
+            return False
+        p = self.profile_path(name)
+        if not p.is_file():
+            return False
+        p.unlink()
+        return True
 
     # --- Manifest ---
 

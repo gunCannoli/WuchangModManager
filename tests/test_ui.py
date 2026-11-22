@@ -55,6 +55,12 @@ class TestUI(unittest.TestCase):
             self.assertEqual(win.table.item(0, 2).text(), "PAK")
             self.assertEqual(win.table.item(1, 1).text(), "PreExisting_P.pak")
             self.assertIn("Unmanaged", win.table.item(1, 5).text())
+            # MO2-style bottom tabs (UE4SS, Paks, Downloads) populated
+            self.assertEqual(win.right_tabs.count(), 3)
+            self.assertEqual(win.tab_paks.rowCount(), 1)
+            self.assertEqual(win.tab_paks.item(0, 2).text(), "PreExisting_P.pak")
+            self.assertTrue(win.table.item(1, 1).font().bold())
+            self.assertTrue(win.table.item(1, 1).font().italic())
 
             # Smoke-construct Onboarding & Settings dialogs
             pkg_root = Path(__file__).resolve().parent.parent
@@ -95,10 +101,25 @@ class TestUI(unittest.TestCase):
             self.assertFalse(ob.row_setup.isEnabled())
             self.assertFalse(ob.btn_finish.isEnabled())
 
+            from wmm.ui.profiles_dialog import ProfilesDialog
+
             sd = SettingsDialog(win.store, t, game=win.game, package_root=pkg_root)
             self.assertGreaterEqual(sd.combo_lang.count(), 1)
             self.assertIn("cli launch -- %command%", sd.edit_steam_launch.text())
+            self.assertEqual(sd.edit_game.cursorPosition(), 0)
+            self.assertEqual(sd.edit_steam_launch.cursorPosition(), 0)
 
+            pd = ProfilesDialog(win.store, t)
+            self.assertGreaterEqual(pd.list_profiles.count(), 1)
+            pd._on_create()
+            pd._commit_pending("boss_rush")
+            self.assertIn("boss_rush", win.store.list_profiles())
+            win.store.clone_profile("boss_rush", "boss_rush_copy")
+            self.assertIn("boss_rush_copy", win.store.list_profiles())
+            self.assertTrue(win.store.delete_profile("boss_rush_copy"))
+            self.assertNotIn("boss_rush_copy", win.store.list_profiles())
+
+            pd.close()
             ob.close()
             sd.close()
             win.close()

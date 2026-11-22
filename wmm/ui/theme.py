@@ -51,8 +51,21 @@ QTableWidget, QTreeWidget, QListWidget, QTextEdit, QPlainTextEdit {{
     color: #E2E4E9;
     border: 1px solid #2E3138;
     gridline-color: #262930;
-    selection-background-color: {ACCENT_HEX};
+    selection-background-color: #2C313C;
     selection-color: #FFFFFF;
+    outline: 0;
+}}
+QTableWidget::item:selected, QTreeWidget::item:selected, QListWidget::item:selected {{
+    background-color: #2C313C;
+    color: #FFFFFF;
+}}
+QTableWidget::item:selected:!active, QTreeWidget::item:selected:!active, QListWidget::item:selected:!active {{
+    background-color: #22262E;
+    color: #D8DCE3;
+}}
+QTableWidget::item:focus, QTreeWidget::item:focus, QListWidget::item:focus {{
+    outline: none;
+    border: none;
 }}
 QHeaderView::section {{
     background-color: #202226;
@@ -106,7 +119,7 @@ def apply_dark_theme(app: QApplication) -> None:
     pal.setColor(QPalette.ColorRole.Text, QColor("#E2E4E9"))
     pal.setColor(QPalette.ColorRole.Button, QColor("#2A2D34"))
     pal.setColor(QPalette.ColorRole.ButtonText, QColor("#E2E4E9"))
-    pal.setColor(QPalette.ColorRole.Highlight, QColor(ACCENT_HEX))
+    pal.setColor(QPalette.ColorRole.Highlight, QColor("#2C313C"))
     pal.setColor(QPalette.ColorRole.HighlightedText, QColor("#FFFFFF"))
     pal.setColor(QPalette.ColorRole.PlaceholderText, QColor("#7A808C"))
     app.setPalette(pal)

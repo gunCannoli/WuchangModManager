@@ -115,19 +115,21 @@ def write_mods_txt(
     managed_mods: list[tuple[str, bool]],
     preserve_unmanaged: bool = True,
     sync_mods_json: bool = True,
+    remove_names: Optional[set[str]] = None,
 ) -> list[tuple[str, bool]]:
     """Write UE4SS mods.txt strictly with LF line endings (§4.3).
 
     Order:
     1. Base UE4SS mods (preserving existing enabled state if present)
     2. Managed mods (in the order provided)
-    3. Unmanaged mods already in mods.txt (if preserve_unmanaged=True)
+    3. Unmanaged mods already in mods.txt (if preserve_unmanaged=True, excluding remove_names)
     4. Keybinds : 1 (always last)
     """
     mods_txt_path = Path(mods_txt_path)
     existing = parse_mods_txt(mods_txt_path)
     existing_map = {n.lower(): (n, en) for n, en in existing}
     managed_map = {n.lower(): (n, en) for n, en in managed_mods}
+    remove_lower = {n.lower() for n in (remove_names or set())}
 
     ordered: list[tuple[str, bool]] = []
     emitted: set[str] = set()
@@ -156,7 +158,7 @@ def write_mods_txt(
     if preserve_unmanaged:
         for name, enabled in existing:
             low = name.lower()
-            if low == LAST_UE4SS_MOD.lower():
+            if low == LAST_UE4SS_MOD.lower() or low in remove_lower:
                 continue
             if low not in emitted:
                 add(name, enabled)
@@ -188,6 +190,8 @@ def write_mods_txt(
                             low = str(item["mod_name"]).lower()
                             if low in state_map:
                                 item["mod_enabled"] = state_map[low]
+                            elif low in remove_lower:
+                                item["mod_enabled"] = False
                     mods_json_path.write_bytes(
                         (json.dumps(data, indent=4) + "\n").encode("utf-8")
                     )

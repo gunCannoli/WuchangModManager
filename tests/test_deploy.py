@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from tests.test_game import _make_fake_exe
@@ -14,6 +15,7 @@ from wmm.engineini import WMM_BP_SECTION, read_section_entries
 from wmm.game import validate_game_root
 from wmm.platform import get_platform
 from wmm.store import Profile, Store
+from wmm.ue4ss import parse_mods_txt
 
 
 class _RunningGamePlatformWrapper:
@@ -136,6 +138,36 @@ class TestDeploy(unittest.TestCase):
             (ldr / "dsound.dll").write_bytes(b"MZ")
             with self.assertRaises(DeployError):
                 mgr.add_mod(ldr)
+
+    def test_profile_switch_removes_inactive_ue4ss_from_mods_txt(self) -> None:
+        with tempfile.TemporaryDirectory() as td:
+            root, game, store, mgr = self._make_env(td)
+
+            # Seed an unmanaged UE4SS entry in mods.txt to ensure it is preserved
+            game.ue4ss_mods_txt.parent.mkdir(parents=True, exist_ok=True)
+            game.ue4ss_mods_txt.write_bytes(b"UnmanagedLua : 1\nKeybinds : 1\n")
+
+            # Add a managed UE4SS mod on the default profile
+            src = root / "MyManagedLua.zip"
+            with zipfile.ZipFile(src, "w") as zf:
+                zf.writestr("MyManagedLua/Scripts/main.lua", "-- test\n")
+            rec = mgr.add_mod(src)
+            mgr.set_enabled(rec.id, True)
+            self.assertTrue((game.ue4ss_mods_dir / "MyManagedLua").exists())
+            names_default = [n for n, _ in parse_mods_txt(game.ue4ss_mods_txt)]
+            self.assertIn("MyManagedLua", names_default)
+            self.assertIn("UnmanagedLua", names_default)
+
+            # Switch to a clean profile with no mods enabled
+            test_prof = Profile(name="test")
+            store.save_profile(test_prof)
+            mgr.apply_profile(test_prof)
+
+            self.assertFalse((game.ue4ss_mods_dir / "MyManagedLua").exists())
+            names_test = [n for n, _ in parse_mods_txt(game.ue4ss_mods_txt)]
+            self.assertNotIn("MyManagedLua", names_test)
+            self.assertIn("UnmanagedLua", names_test)
+            self.assertEqual(names_test[-1], "Keybinds")
 
 
 if __name__ == "__main__":

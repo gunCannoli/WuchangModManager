@@ -13,6 +13,22 @@ class ExtractError(Exception):
     """Raised when an archive cannot be extracted safely."""
 
 
+def sniff_archive_format(path: Path) -> Optional[str]:
+    """Detect archive extension from magic bytes (handles extensionless CDN downloads)."""
+    try:
+        with Path(path).open("rb") as f:
+            head = f.read(8)
+    except OSError:
+        return None
+    if head.startswith((b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")):
+        return ".zip"
+    if head.startswith(b"7z\xbc\xaf'\x1c"):
+        return ".7z"
+    if head.startswith((b"Rar!\x1a\x07\x00", b"Rar!\x1a\x07\x01\x00")):
+        return ".rar"
+    return None
+
+
 def find_7z(tools_dir: Optional[Path] = None) -> Optional[Path]:
     """Locate 7z executable: bundled tools/7z.exe first, then PATH."""
     if tools_dir is not None:
@@ -48,6 +64,8 @@ def extract_archive(
 
     dest_dir.mkdir(parents=True, exist_ok=True)
     ext = archive_path.suffix.lower()
+    if ext not in (".zip", ".7z", ".rar"):
+        ext = sniff_archive_format(archive_path) or ext
 
     if ext == ".zip":
         try:

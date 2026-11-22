@@ -7,12 +7,13 @@ import os
 import re
 import shutil
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 
 from . import APP_NAME, __version__
 from .config_merge import merge_lua_config_files
@@ -144,17 +145,64 @@ class NexusClient:
         newer.sort(key=lambda f: int(f.get("file_id", 0)), reverse=True)
         return newer[0]
 
-    def download_url(self, url: str, dest_dir: Path, filename: Optional[str] = None) -> Path:
+    def download_url(
+        self,
+        url: str,
+        dest_dir: Path,
+        filename: Optional[str] = None,
+        progress_cb: Optional[Callable[[str, int, int, float], None]] = None,
+    ) -> Path:
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        if not filename:
-            parsed = urllib.parse.urlparse(url)
-            filename = Path(urllib.parse.unquote(parsed.path)).name or "download.zip"
-        dest = dest_dir / filename
         req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{__version__}"})
         open_fn = self._opener.open if self._opener else urllib.request.urlopen
-        with open_fn(req, timeout=120) as resp, dest.open("wb") as out:
-            shutil.copyfileobj(resp, out)
+        with open_fn(req, timeout=120) as resp:
+            if not filename:
+                # 1. Try Content-Disposition header (Nexus CDN URLs often have UUID paths)
+                cd = resp.headers.get("Content-Disposition") or resp.headers.get("content-disposition") or ""
+                m_star = re.search(r"filename\*\s*=\s*(?:UTF-8''|utf-8'')([^;]+)", cd)
+                m_plain = re.search(r'filename\s*=\s*"?([^";]+)"?', cd)
+                if m_star:
+                    filename = Path(urllib.parse.unquote(m_star.group(1).strip())).name
+                elif m_plain:
+                    filename = Path(m_plain.group(1).strip()).name
+            if not filename:
+                parsed = urllib.parse.urlparse(url)
+                filename = Path(urllib.parse.unquote(parsed.path)).name or "download.zip"
+            # Sanitize invalid Windows filename characters
+            filename = re.sub(r'[<>:"/\\|?*]+', "_", filename).strip(" .") or "download.zip"
+            dest = dest_dir / filename
+
+            clen_raw = resp.headers.get("Content-Length") or resp.headers.get("content-length") or "0"
+            total_bytes = int(clen_raw) if str(clen_raw).isdigit() else 0
+            downloaded = 0
+            t_start = time.monotonic()
+            last_emit = 0.0
+
+            with dest.open("wb") as out:
+                while True:
+                    chunk = resp.read(65536)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+                    downloaded += len(chunk)
+                    if progress_cb is not None:
+                        now = time.monotonic()
+                        if now - last_emit >= 0.08 or (total_bytes and downloaded >= total_bytes):
+                            elapsed = max(0.001, now - t_start)
+                            progress_cb(filename, downloaded, total_bytes, downloaded / elapsed)
+                            last_emit = now
+
+        # 2. If still missing archive extension (e.g. UUID filename), sniff magic bytes and rename
+        if dest.suffix.lower() not in (".zip", ".7z", ".rar", ".pak"):
+            from .extract import sniff_archive_format
+            ext = sniff_archive_format(dest)
+            if ext:
+                renamed = dest.with_name(dest.name + ext)
+                if renamed.exists():
+                    renamed.unlink()
+                dest.rename(renamed)
+                dest = renamed
         return dest
 
 

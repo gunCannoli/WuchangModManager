@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -13,7 +14,9 @@ from PySide6.QtWidgets import (
     QDialog,
     QFileDialog,
     QFormLayout,
+    QGroupBox,
     QHBoxLayout,
+    QLabel,
     QLineEdit,
     QMessageBox,
     QPushButton,
@@ -53,52 +56,46 @@ class SettingsDialog(QDialog):
         self.setMinimumWidth(520)
         self._build_ui()
 
+    def _make_label(self, text: str) -> QLabel:
+        lbl = QLabel(text)
+        lbl.setFixedWidth(96)
+        lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        return lbl
+
     def _build_ui(self) -> None:
         settings = self.store.load_settings()
         root = QVBoxLayout(self)
-        form = QFormLayout()
-        form.setSpacing(10)
+        root.setSpacing(10)
+        btn_width = 80
 
-        # Game path
+        # 1. General (Game folder, Language, Engine.ini performance preset)
+        gen_group = QGroupBox(self.t.tr("settings.general_group").replace("&", "&&"))
+        gen_form = QFormLayout(gen_group)
+        gen_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        gen_form.setSpacing(8)
+
         game_row = QHBoxLayout()
         self.edit_game = QLineEdit(str(self.game.root) if self.game else settings.get("game_path", ""))
         self.edit_game.setReadOnly(True)
+        self.edit_game.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.edit_game.setCursorPosition(0)
         btn_browse = QPushButton(self.t.tr("btn.change"))
+        btn_browse.setFixedWidth(btn_width)
         btn_browse.clicked.connect(self._browse_game)
         game_row.addWidget(self.edit_game, 1)
         game_row.addWidget(btn_browse)
-        form.addRow(self.t.tr("settings.game_path"), game_row)
+        gen_form.addRow(self._make_label(self.t.tr("settings.game_path")), game_row)
 
-        # Language (populated from lang/*.json; users drop <code >.json to add languages)
+        # Language (populated from lang/*.json; users drop <code>.json to add languages)
         self.combo_lang = QComboBox()
         current_lang = settings.get("language", "en")
         for code, display in self.t.available_languages():
             self.combo_lang.addItem(f"{display} ({code})", code)
             if code == current_lang:
                 self.combo_lang.setCurrentIndex(self.combo_lang.count() - 1)
-        form.addRow(self.t.tr("settings.language"), self.combo_lang)
+        gen_form.addRow(self._make_label(self.t.tr("settings.language")), self.combo_lang)
 
-        # Nexus API key (stored encrypted via platform.protect_secret)
-        self.edit_api = QLineEdit()
-        self.edit_api.setEchoMode(QLineEdit.EchoMode.Password)
-        raw_token = settings.get("nexus_api_key", "")
-        if raw_token:
-            try:
-                self.edit_api.setText(self.plat.unprotect_secret(raw_token))
-            except Exception:
-                pass
-        form.addRow(self.t.tr("settings.nexus_key"), self.edit_api)
-
-        # Options
-        self.chk_nxm = QCheckBox(self.t.tr("settings.nxm_handler"))
-        self.chk_nxm.setChecked(bool(settings.get("nxm_registered", False)))
-        form.addRow("", self.chk_nxm)
-
-        self.chk_keep = QCheckBox(self.t.tr("settings.keep_archives"))
-        self.chk_keep.setChecked(bool(settings.get("keep_archives", False)))
-        form.addRow("", self.chk_keep)
-
-        # Engine.ini performance preset (Restore original / Default / VRR)
+        # Engine.ini performance preset (Off / Default / VRR)
         ini_row = QHBoxLayout()
         self.combo_perf = QComboBox()
         self.combo_perf.addItem(self.t.tr("settings.perf_restore"), "none")
@@ -114,25 +111,70 @@ class SettingsDialog(QDialog):
             ini_enabled = False
         self.combo_perf.setEnabled(ini_enabled)
         btn_apply_ini = QPushButton(self.t.tr("btn.apply"))
+        btn_apply_ini.setFixedWidth(btn_width)
         btn_apply_ini.setEnabled(ini_enabled)
         btn_apply_ini.clicked.connect(self._apply_engine_ini)
         ini_row.addWidget(self.combo_perf, 1)
         ini_row.addWidget(btn_apply_ini)
-        form.addRow(self.t.tr("onboarding.step_ini"), ini_row)
+        gen_form.addRow(self._make_label(self.t.tr("onboarding.step_ini")), ini_row)
+        root.addWidget(gen_group)
 
-        # Steam Launch Options command (lets Steam launch through WMM)
+        # 2. Nexus Mods (API key, nxm:// handler)
+        nexus_group = QGroupBox(self.t.tr("settings.nexus_group").replace("&", "&&"))
+        nexus_form = QFormLayout(nexus_group)
+        nexus_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        nexus_form.setSpacing(8)
+
+        self.edit_api = QLineEdit()
+        self.edit_api.setEchoMode(QLineEdit.EchoMode.Password)
+        self.edit_api.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        raw_token = settings.get("nexus_api_key", "")
+        if raw_token:
+            try:
+                self.edit_api.setText(self.plat.unprotect_secret(raw_token))
+                self.edit_api.setCursorPosition(0)
+            except Exception:
+                pass
+        nexus_form.addRow(self._make_label(self.t.tr("settings.nexus_key")), self.edit_api)
+
+        self.chk_nxm = QCheckBox(self.t.tr("settings.nxm_handler"))
+        self.chk_nxm.setChecked(bool(settings.get("nxm_registered", False)))
+        nexus_form.addRow(self._make_label(""), self.chk_nxm)
+        root.addWidget(nexus_group)
+
+        # 3. Downloads (Auto-extract, Keep archives)
+        dl_group = QGroupBox(self.t.tr("settings.downloads_group").replace("&", "&&"))
+        dl_lay = QVBoxLayout(dl_group)
+        dl_lay.setSpacing(6)
+        self.chk_auto_extract = QCheckBox(self.t.tr("settings.auto_extract"))
+        self.chk_auto_extract.setChecked(bool(settings.get("auto_extract", False)))
+        self.chk_keep = QCheckBox(self.t.tr("settings.keep_archives"))
+        self.chk_keep.setChecked(bool(settings.get("keep_archives", True)))
+        dl_lay.addWidget(self.chk_auto_extract)
+        dl_lay.addWidget(self.chk_keep)
+        root.addWidget(dl_group)
+
+        # 4. Launch & Setup (Steam launch, Re-run onboarding, Desktop shortcut)
+        launch_group = QGroupBox(self.t.tr("settings.launch_group").replace("&", "&&"))
+        launch_lay = QVBoxLayout(launch_group)
+        launch_lay.setSpacing(8)
+
+        launch_form = QFormLayout()
+        launch_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        launch_form.setSpacing(8)
         launch_row = QHBoxLayout()
         self.edit_steam_launch = QLineEdit(steam_launch_option_string())
         self.edit_steam_launch.setReadOnly(True)
+        self.edit_steam_launch.setAlignment(Qt.AlignmentFlag.AlignLeft)
+        self.edit_steam_launch.setCursorPosition(0)
         btn_copy_launch = QPushButton(self.t.tr("btn.copy"))
+        btn_copy_launch.setFixedWidth(btn_width)
         btn_copy_launch.clicked.connect(self._copy_steam_launch)
         launch_row.addWidget(self.edit_steam_launch, 1)
         launch_row.addWidget(btn_copy_launch)
-        form.addRow(self.t.tr("settings.steam_launch"), launch_row)
+        launch_form.addRow(self._make_label(self.t.tr("settings.steam_launch")), launch_row)
+        launch_lay.addLayout(launch_form)
 
-        root.addLayout(form)
-
-        # Tools row: Run onboarding again + Desktop shortcut
         tools_row = QHBoxLayout()
         btn_base = QPushButton(self.t.tr("settings.run_onboarding"))
         btn_base.clicked.connect(self._open_mod_base)
@@ -141,14 +183,17 @@ class SettingsDialog(QDialog):
         tools_row.addWidget(btn_base)
         tools_row.addWidget(btn_shortcut)
         tools_row.addStretch(1)
-        root.addLayout(tools_row)
+        launch_lay.addLayout(tools_row)
+        root.addWidget(launch_group)
 
-        # Save / Cancel
+        # Save / Cancel (same fixed width as action buttons)
         footer = QHBoxLayout()
         footer.addStretch(1)
         btn_cancel = QPushButton(self.t.tr("btn.cancel"))
+        btn_cancel.setFixedWidth(btn_width)
         btn_cancel.clicked.connect(self.reject)
         btn_save = QPushButton(self.t.tr("btn.apply"))
+        btn_save.setFixedWidth(btn_width)
         btn_save.setProperty("accent", True)
         btn_save.clicked.connect(self._save)
         footer.addWidget(btn_cancel)
@@ -165,6 +210,7 @@ class SettingsDialog(QDialog):
             return
         self.game = inst
         self.edit_game.setText(str(inst.root))
+        self.edit_game.setCursorPosition(0)
 
     def _apply_engine_ini(self) -> None:
         if self.game is None or self.game.engine_ini_path is None or not self.game.engine_ini_path.is_file():
@@ -201,6 +247,7 @@ class SettingsDialog(QDialog):
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.game is not None:
             self.game = dlg.game
             self.edit_game.setText(str(dlg.game.root))
+            self.edit_game.setCursorPosition(0)
 
     def _remove_all(self) -> None:
         if self.game is None:
@@ -228,6 +275,7 @@ class SettingsDialog(QDialog):
 
         api_key = self.edit_api.text().strip()
         settings["nexus_api_key"] = self.plat.protect_secret(api_key) if api_key else ""
+        settings["auto_extract"] = self.chk_auto_extract.isChecked()
         settings["keep_archives"] = self.chk_keep.isChecked()
 
         want_nxm = self.chk_nxm.isChecked()

@@ -11,7 +11,7 @@ from typing import Optional
 
 from .detect import DetectedComponent, DetectionResult, detect_mod
 from .engineini import apply_ini_tweak_block, update_wmm_bp_section
-from .extract import extract_archive
+from .extract import extract_archive, sniff_archive_format
 from .game import GameInstall, running_game_processes
 from .paks import assign_custom_order_names
 from .platform import Platform, get_platform
@@ -135,7 +135,10 @@ class Manager:
         settings = self.store.load_settings()
         aes_key = settings.get("aes_key") or None
 
-        is_archive = source.is_file() and source.suffix.lower() in (".zip", ".7z", ".rar")
+        is_archive = source.is_file() and (
+            source.suffix.lower() in (".zip", ".7z", ".rar")
+            or sniff_archive_format(source) is not None
+        )
         tmp_dir: Optional[Path] = None
         try:
             if is_archive:
@@ -192,12 +195,17 @@ class Manager:
             )
             self.store.save_mod(record)
 
-            # Delete archive if it lived inside downloads/ and keep_archives is False
+            # Delete archive after install if keep_archives is False and it lives in WMM's downloads/mods folder
             if keep_archive is None:
-                keep_archive = bool(settings.get("keep_archives", False))
+                keep_archive = bool(settings.get("keep_archives", True))
             if is_archive and not keep_archive:
                 try:
-                    if self.store.downloads_dir.resolve() in source.resolve().parents:
+                    src_res = source.resolve()
+                    managed_dl_dirs = [self.store.downloads_dir.resolve()]
+                    mad = settings.get("mods_archive_dir", "")
+                    if mad:
+                        managed_dl_dirs.append(Path(mad).resolve())
+                    if any(d in src_res.parents for d in managed_dl_dirs):
                         source.unlink(missing_ok=True)
                 except OSError:
                     pass
@@ -437,6 +445,21 @@ class Manager:
         self._undeploy_manifest(manifest)
         self.store.save_manifest([])
 
+        if self.game.ue4ss_mods_txt.is_file():
+            all_managed_names = {
+                comp.name
+                for mod in self.store.list_mods()
+                for comp in mod.components
+                if comp.kind == "ue4ss_mod"
+            }
+            if all_managed_names:
+                write_mods_txt(
+                    self.game.ue4ss_mods_txt,
+                    [],
+                    preserve_unmanaged=True,
+                    remove_names=all_managed_names,
+                )
+
         if self.game.engine_ini_path is not None and self.game.engine_ini_path.is_file():
             update_wmm_bp_section(self.game.engine_ini_path, [], backup_dir=self.store.backup_dir)
         return count
@@ -582,17 +605,20 @@ class Manager:
 
         # Update mods.txt (LF-only) if any UE4SS mods exist or mods.txt already exists
         if ue4ss_entries or self.game.ue4ss_mods_txt.is_file():
-            # Also mark disabled managed UE4SS mods as : 0 so mods.txt stays clean
-            all_managed_ue4ss = dict(ue4ss_entries)
+            # Prune managed UE4SS mods that are not active in this profile so switching
+            # profiles cleanly removes them from mods.txt instead of leaving stale entries.
+            active_lower = {n.lower() for n, _ in ue4ss_entries}
+            inactive_managed: set[str] = set()
             for mod in self.store.list_mods():
-                if mod.id not in prof.enabled_mods:
-                    for comp in mod.components:
-                        if comp.kind == "ue4ss_mod" and comp.name not in all_managed_ue4ss:
-                            all_managed_ue4ss[comp.name] = False
-            ordered_txt = [(n, en) for n, en in ue4ss_entries] + [
-                (n, False) for n, en in all_managed_ue4ss.items() if not en
-            ]
-            write_mods_txt(self.game.ue4ss_mods_txt, ordered_txt, preserve_unmanaged=True)
+                for comp in mod.components:
+                    if comp.kind == "ue4ss_mod" and comp.name.lower() not in active_lower:
+                        inactive_managed.add(comp.name)
+            write_mods_txt(
+                self.game.ue4ss_mods_txt,
+                ue4ss_entries,
+                preserve_unmanaged=True,
+                remove_names=inactive_managed,
+            )
 
         # 6. Update Engine.ini for BP mods & ini tweaks
         if self.game.engine_ini_path is not None and (bp_mod_names or self.game.engine_ini_path.is_file()):

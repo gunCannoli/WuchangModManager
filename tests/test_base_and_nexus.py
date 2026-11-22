@@ -117,6 +117,22 @@ class TestBaseAndNexus(unittest.TestCase):
         self.assertEqual(client.rate_limits["x-rl-hourly-remaining"], "99")
         self.assertIsNone(client.check_update(mod_id=42, current_file_id=150))
 
+    def test_download_url_uuid_sniffing_and_content_disposition(self) -> None:
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("hello.txt", "world")
+        zip_bytes = buf.getvalue()
+
+        with tempfile.TemporaryDirectory() as td:
+            # Case 1: UUID URL with no Content-Disposition -> sniffed as .zip
+            opener1 = _FakeOpener({"64991fdd": zip_bytes})
+            c1 = NexusClient("dummy", opener=opener1)
+            p1 = c1.download_url("https://cf-files.nexusmods.com/64991fdd-0c00-45f9-bf07-6c21f96c5414", Path(td))
+            self.assertEqual(p1.suffix, ".zip")
+            self.assertTrue(p1.is_file())
+
     def test_update_mod_preserving_configs(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             root = Path(td)
