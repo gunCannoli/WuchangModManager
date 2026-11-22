@@ -6,15 +6,17 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QFont
+from PySide6.QtCore import QEvent, QRect, QSize, Qt, QThread, QTimer, Signal
+from PySide6.QtGui import QAction, QBrush, QColor, QDragEnterEvent, QDropEvent, QFont, QPalette
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -23,12 +25,17 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QInputDialog,
     QLabel,
+    QLineEdit,
     QMainWindow,
     QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QSplitter,
     QStatusBar,
     QTableWidget,
@@ -49,15 +56,20 @@ from ..nexus import (
     NexusClient,
     NexusError,
     nexus_mod_url,
+    parse_nexus_archive_name,
     parse_nexus_mod_id_from_filename,
     parse_nxm_uri,
+    is_update_available,
+    latest_main_file,
     update_mod_preserving_configs,
+    version_key,
 )
 from ..paks import PakConflictReport, parse_pak_priority, scan_folder_conflicts
 from ..platform import get_platform
 from ..store import ModRecord, Profile, Store
 from ..ue4ss import BASE_UE4SS_MODS, LAST_UE4SS_MOD, parse_mods_txt, write_mods_txt
 from .details_dialog import ModDetailsDialog
+from .icons import mdi_icon
 from .onboarding import OnboardingDialog
 from .profiles_dialog import ProfilesDialog
 from .settings_dialog import SettingsDialog
@@ -136,6 +148,88 @@ class _DownloadWorker(QThread):
             self.failed.emit(self.dl_id, str(exc))
 
 
+def _ordered_mods(mods: list[ModRecord], prof: Profile) -> list[ModRecord]:
+    """Managed mods in the profile's mod order (unlisted mods follow in store order)."""
+    idx = {mid: i for i, mid in enumerate(prof.mod_order)}
+    return sorted(mods, key=lambda m: idx.get(m.id, len(idx)))  # stable: keeps store order for ties
+
+
+class _RowDelegate(QStyledItemDelegate):
+    """Selected rows only change background (text keeps its own colour); checkboxes are centred."""
+
+    def initStyleOption(self, option, index) -> None:  # noqa: N802
+        super().initStyleOption(option, index)
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        if fg is not None:
+            color = fg.color() if isinstance(fg, QBrush) else QColor(fg)
+        else:
+            color = option.palette.color(QPalette.ColorRole.Text)
+        option.palette.setBrush(QPalette.ColorGroup.All, QPalette.ColorRole.HighlightedText, QBrush(color))
+
+    def _check_rect(self, option):
+        style = option.widget.style() if option.widget else QApplication.style()
+        base = style.subElementRect(QStyle.SubElement.SE_ItemViewItemCheckIndicator, option, option.widget)
+        r = QRect(base)
+        r.moveCenter(option.rect.center())
+        return r
+
+    def paint(self, painter, option, index) -> None:
+        if index.column() != 0 or index.data(Qt.ItemDataRole.CheckStateRole) is None:
+            super().paint(painter, option, index)
+            return
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        checked = opt.checkState == Qt.CheckState.Checked
+        opt.features &= ~QStyleOptionViewItem.ViewItemFeature.HasCheckIndicator
+        style = opt.widget.style() if opt.widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, opt.widget)
+        ind = QStyleOptionViewItem(option)
+        self.initStyleOption(ind, index)
+        ind.rect = self._check_rect(ind)
+        ind.state = (ind.state & ~(QStyle.StateFlag.State_On | QStyle.StateFlag.State_Off)) | (
+            QStyle.StateFlag.State_On if checked else QStyle.StateFlag.State_Off
+        )
+        style.drawPrimitive(QStyle.PrimitiveElement.PE_IndicatorItemViewItemCheck, ind, painter, opt.widget)
+
+    def editorEvent(self, event, model, option, index) -> bool:  # noqa: N802
+        if index.column() == 0 and index.data(Qt.ItemDataRole.CheckStateRole) is not None:
+            flags = index.flags()
+            if event.type() in (QEvent.Type.MouseButtonRelease, QEvent.Type.MouseButtonDblClick):
+                if event.type() == QEvent.Type.MouseButtonRelease and event.button() == Qt.MouseButton.LeftButton:
+                    if (flags & Qt.ItemFlag.ItemIsUserCheckable) and (flags & Qt.ItemFlag.ItemIsEnabled):
+                        cur = index.data(Qt.ItemDataRole.CheckStateRole)  # int or enum depending on the binding
+                        is_on = cur == Qt.CheckState.Checked or cur == Qt.CheckState.Checked.value
+                        new = Qt.CheckState.Unchecked if is_on else Qt.CheckState.Checked
+                        model.setData(index, new, Qt.ItemDataRole.CheckStateRole)
+                return True
+        return super().editorEvent(event, model, option, index)
+
+
+class _UpdateCheckWorker(QThread):
+    """Asks Nexus for the newest main file of each managed mod (one files.json call per mod)."""
+
+    done = Signal(dict, str)  # {mod_id: {"v": version, "f": file_id}}, error text ("" if none)
+
+    def __init__(self, api_key: str, targets: list[tuple[str, int]], parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.api_key = api_key
+        self.targets = targets
+
+    def run(self) -> None:
+        result: dict[str, dict] = {}
+        err = ""
+        client = NexusClient(self.api_key)
+        for mod_id, nexus_id in self.targets:
+            try:
+                latest = latest_main_file(client.get_mod_files(nexus_id))
+            except Exception as exc:  # noqa: BLE001
+                err = str(exc)
+                break  # rate limit or network problem: stop, keep what we have
+            if latest is not None:
+                result[mod_id] = {"v": str(latest.get("version") or ""), "f": int(latest.get("file_id", 0))}
+        self.done.emit(result, err)
+
+
 class _ResponsiveTable(QTableWidget):
     """Table where all data columns are user-resizable with zero dead space.
 
@@ -145,12 +239,46 @@ class _ResponsiveTable(QTableWidget):
     - On ties, the State/Status column (last column) is expanded.
     """
 
+    rowMoved = Signal(int, int)  # (source row, destination row) after a drag & drop
+    spacePressed = Signal()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        if event.key() == Qt.Key.Key_Space and event.modifiers() == Qt.KeyboardModifier.NoModifier:
+            self.spacePressed.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def enable_row_drag(self) -> None:
+        """Allow dragging a row onto another row; the owner reorders its own model on rowMoved."""
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.viewport().setAcceptDrops(True)
+        self.setDropIndicatorShown(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.InternalMove)
+        self.setDefaultDropAction(Qt.DropAction.MoveAction)
+
+    def dropEvent(self, event: QDropEvent) -> None:  # noqa: N802
+        if self.dragDropMode() != QAbstractItemView.DragDropMode.InternalMove or event.source() is not self:
+            super().dropEvent(event)
+            return
+        src = self.currentRow()
+        dst = self.rowAt(int(event.position().y()))
+        if dst < 0:
+            dst = self.rowCount() - 1
+        # Never let Qt move/delete the cells itself; the owner rebuilds the table.
+        event.setDropAction(Qt.DropAction.IgnoreAction)
+        event.accept()
+        if src >= 0 and dst >= 0 and src != dst:
+            QTimer.singleShot(0, lambda: self.rowMoved.emit(src, dst))
+
     def __init__(self, rows: int, cols: int, flex_col: int = 1, parent: Optional[QWidget] = None):
         super().__init__(rows, cols, parent)
         self.flex_col = flex_col
         self.status_col = cols - 1
         self._adjusting = False
         self.horizontalHeader().sectionResized.connect(self._on_col_resized)
+        self.setItemDelegate(_RowDelegate(self))
 
     def _interactive_cols(self) -> list[int]:
         hdr = self.horizontalHeader()
@@ -328,6 +456,11 @@ class MainWindow(QMainWindow):
         self._dl_seq = 0
         self._suppress_table_signals = False
         self._suppress_right_signals = False
+        self._sort_col: Optional[int] = None  # None = default (profile order); else left-table column
+        self._sort_desc = False
+        self._pak_rows: list[tuple[Optional[tuple[str, str]], str, bool]] = []
+        self._update_cache: dict[str, dict] = dict(settings.get("update_cache", {}).get("latest", {}))
+        self._update_worker: Optional[_UpdateCheckWorker] = None
         self._game_unlocked = False
         self._lock_dialog: Optional[_GameLockDialog] = None
 
@@ -352,6 +485,46 @@ class MainWindow(QMainWindow):
         self._game_poll_timer.timeout.connect(self._poll_game_running)
         self._game_poll_timer.start()
         self._poll_game_running()
+        QTimer.singleShot(1500, self._start_update_check)
+
+    def _start_update_check(self, force: bool = False) -> None:
+        """Background Nexus update check (needs an API key; cached 6 h unless forced)."""
+        if self._update_worker is not None:
+            return
+        settings = self.store.load_settings()
+        raw_key = settings.get("nexus_api_key", "")
+        api_key = self.plat.unprotect_secret(raw_key) if raw_key else ""
+        if not api_key:
+            return
+        age = time.time() - float(settings.get("update_cache", {}).get("ts", 0))
+        if not force and age < 6 * 3600:
+            return
+        targets = []
+        for m in self.store.list_mods():
+            nid = self._resolve_nexus_mod_id(m)
+            if nid:
+                targets.append((m.id, nid))
+        if not targets:
+            return
+        worker = _UpdateCheckWorker(api_key, targets, parent=self)
+        worker.done.connect(self._on_update_check_done)
+        self._update_worker = worker
+        worker.start()
+
+    def _on_update_check_done(self, result: dict, err: str) -> None:
+        self._update_worker = None
+        if err:
+            self._log(f"[Nexus] update check stopped: {err}")
+        if result:
+            self._update_cache.update(result)
+            settings = self.store.load_settings()
+            settings["update_cache"] = {"ts": time.time(), "latest": self._update_cache}
+            self.store.save_settings(settings)
+            self.refresh_all()
+
+    def _on_refresh_clicked(self) -> None:
+        self.refresh_all()
+        self._start_update_check(force=True)
 
     def _start_nxm_ipc_server(self) -> None:
         self._ipc_server = QLocalServer(self)
@@ -447,20 +620,24 @@ class MainWindow(QMainWindow):
     def _build_toolbar(self) -> None:
         tb = QToolBar()
         tb.setMovable(False)
+        tb.setIconSize(QSize(20, 20))
         self.addToolBar(tb)
 
-        self.btn_add = QPushButton(self.t.tr("btn.add"))
-        self.btn_add.clicked.connect(self._on_add)
-        tb.addWidget(self.btn_add)
+        def icon_button(icon: str, tip: str, slot, accent: bool = False) -> QPushButton:
+            b = QPushButton()
+            b.setIcon(mdi_icon(icon))
+            b.setIconSize(QSize(20, 20))
+            b.setToolTip(tip)
+            b.setFixedSize(36, 30)
+            if accent:
+                b.setProperty("accent", True)
+            b.clicked.connect(slot)
+            tb.addWidget(b)
+            return b
 
-        self.btn_download = QPushButton(self.t.tr("btn.download"))
-        self.btn_download.clicked.connect(self._on_download)
-        tb.addWidget(self.btn_download)
-
-        self.btn_play = QPushButton(self.t.tr("btn.play"))
-        self.btn_play.setProperty("accent", True)
-        self.btn_play.clicked.connect(self._on_play)
-        tb.addWidget(self.btn_play)
+        self.btn_refresh = icon_button("refresh", self.t.tr("btn.refresh.tip"), self._on_refresh_clicked)
+        self.btn_add = icon_button("plus", self.t.tr("btn.add"), self._on_add)
+        self.btn_play = icon_button("play", self.t.tr("btn.play"), self._on_play, accent=True)
 
         tb.addSeparator()
 
@@ -469,19 +646,21 @@ class MainWindow(QMainWindow):
         self.combo_profile.currentIndexChanged.connect(self._on_profile_changed)
         tb.addWidget(self.combo_profile)
 
-        self.btn_profiles = QPushButton(self.t.tr("btn.profiles"))
-        self.btn_profiles.clicked.connect(self._on_manage_profiles)
-        tb.addWidget(self.btn_profiles)
+        self.btn_profiles = icon_button("account", self.t.tr("btn.profiles"), self._on_manage_profiles)
 
         tb.addSeparator()
+        self.edit_filter = QLineEdit()
+        self.edit_filter.setPlaceholderText(self.t.tr("filter.placeholder"))
+        self.edit_filter.setToolTip(self.t.tr("filter.tip"))
+        self.edit_filter.setClearButtonEnabled(True)
+        self.edit_filter.setMinimumWidth(120)
+        self.edit_filter.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self.edit_filter.textChanged.connect(self._apply_filter)
+        tb.addWidget(self.edit_filter)
+        tb.addSeparator()
 
-        self.btn_settings = QPushButton(self.t.tr("btn.settings"))
-        self.btn_settings.clicked.connect(self._on_settings)
-        tb.addWidget(self.btn_settings)
-
-        self.btn_log = QPushButton(self.t.tr("btn.log"))
-        self.btn_log.clicked.connect(self._on_show_log)
-        tb.addWidget(self.btn_log)
+        self.btn_log = icon_button("log", self.t.tr("btn.log"), self._on_show_log)
+        self.btn_settings = icon_button("cog", self.t.tr("btn.settings"), self._on_settings)
 
     def _build_body(self) -> None:
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -500,19 +679,26 @@ class MainWindow(QMainWindow):
         )
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)  # shift / ctrl
         self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._on_table_context_menu)
         self.table.itemChanged.connect(self._on_item_changed)
         self.table.itemSelectionChanged.connect(self._on_selection_changed)
+        self.table.enable_row_drag()
+        self.table.rowMoved.connect(self._on_mod_row_moved)
+        self.table.cellDoubleClicked.connect(self._on_mod_row_activated)
+        self.table.spacePressed.connect(self._on_mods_space)
 
         hdr = self.table.horizontalHeader()
         hdr.setStretchLastSection(False)
+        hdr.setSectionsClickable(True)
+        hdr.setHighlightSections(False)
+        hdr.sectionClicked.connect(self._on_header_clicked)
         hdr.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
         self.table.setColumnWidth(0, 32)
-        for col, width in ((1, 240), (2, 85), (3, 70), (4, 65), (5, 105)):
+        for col, width in ((1, 230), (2, 85), (3, 90), (4, 65), (5, 95)):
             hdr.setSectionResizeMode(col, QHeaderView.ResizeMode.Interactive)
             self.table.setColumnWidth(col, width)
 
@@ -520,26 +706,32 @@ class MainWindow(QMainWindow):
         self.right_tabs = QTabWidget()
         self.right_tabs.setTabPosition(QTabWidget.TabPosition.South)
 
-        # Tab 1: UE4SS ([On, Installed, State])
+        # Tab 1: UE4SS ([On, Mod name, State])
         self.tab_ue4ss = _ResponsiveTable(0, 3, flex_col=1)
         self.tab_ue4ss.setHorizontalHeaderLabels(["", self.t.tr("tabcol.item"), self.t.tr("tabcol.state")])
         self._style_right_table(self.tab_ue4ss, col_widths={0: (30, True), 1: (180, False), 2: (100, False)})
         self.tab_ue4ss.itemChanged.connect(self._on_ue4ss_item_changed)
         self.tab_ue4ss.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tab_ue4ss.customContextMenuRequested.connect(self._on_ue4ss_context_menu)
+        self.tab_ue4ss.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tab_ue4ss.spacePressed.connect(self._on_ue4ss_space)
         self.right_tabs.addTab(self.tab_ue4ss, self.t.tr("tab.ue4ss"))
 
-        # Tab 2: Paks ([On, Order, Name, State])
-        self.tab_paks = _ResponsiveTable(0, 4, flex_col=2)
+        # Tab 2: Paks ([On, Mod name, Order, State])
+        self.tab_paks = _ResponsiveTable(0, 4, flex_col=1)
         self.tab_paks.setHorizontalHeaderLabels(
-            ["", self.t.tr("tabcol.load_order"), self.t.tr("col.name"), self.t.tr("tabcol.state")]
+            ["", self.t.tr("col.name"), self.t.tr("tabcol.load_order"), self.t.tr("tabcol.state")]
         )
         self._style_right_table(
-            self.tab_paks, col_widths={0: (30, True), 1: (46, False), 2: (180, False), 3: (95, False)}
+            self.tab_paks, col_widths={0: (30, True), 1: (180, False), 2: (46, False), 3: (95, False)}
         )
         self.tab_paks.itemChanged.connect(self._on_pak_item_changed)
+        self.tab_paks.enable_row_drag()
+        self.tab_paks.rowMoved.connect(self._on_pak_row_moved)
         self.tab_paks.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tab_paks.customContextMenuRequested.connect(self._on_paks_context_menu)
+        self.tab_paks.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.tab_paks.spacePressed.connect(self._on_paks_space)
         self.right_tabs.addTab(self.tab_paks, self.t.tr("tab.paks"))
 
         # Tab 3: Downloads ([File, Size, State/Progress])
@@ -551,6 +743,7 @@ class MainWindow(QMainWindow):
         self.tab_downloads.cellDoubleClicked.connect(self._on_download_row_activated)
         self.tab_downloads.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tab_downloads.customContextMenuRequested.connect(self._on_downloads_context_menu)
+        self.tab_downloads.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.right_tabs.addTab(self.tab_downloads, self.t.tr("tab.downloads"))
         self.right_tabs.currentChanged.connect(self._on_right_tab_changed)
 
@@ -601,7 +794,8 @@ class MainWindow(QMainWindow):
         self._refresh_profiles_combo()
         prof = self.store.load_profile()
         enabled_set = set(prof.enabled_mods)
-        mods = self.store.list_mods()
+        mods = _ordered_mods(self.store.list_mods(), prof)  # true profile order (also feeds the right tabs)
+        order_of = {m.id: i for i, m in enumerate(mods)}
         manifest = self.store.load_manifest()
 
         # Recompute conflicts if game is present
@@ -620,9 +814,23 @@ class MainWindow(QMainWindow):
         unmanaged_list = scan_unmanaged_mods(self.game, manifest) if self.game is not None else []
         self.unmanaged_mods = {f"unmanaged:{u.folder}:{u.name}": u for u in unmanaged_list}
 
+        status_of = {m.id: self._compute_mod_status(m, deployed_by_mod.get(m.id, [])) for m in mods}
+        display_mods = mods
+        if self._sort_col is not None:
+            col = self._sort_col
+            keys = {
+                0: lambda m: m.id in enabled_set,
+                1: lambda m: m.name.lower(),
+                2: lambda m: (m.badge or "").lower(),
+                3: lambda m: version_key(m.version or ""),
+                4: lambda m: order_of[m.id],
+                5: lambda m: status_of[m.id][0],
+            }
+            display_mods = sorted(mods, key=keys[col], reverse=self._sort_desc)
+
         self._suppress_table_signals = True
         self.table.setRowCount(len(mods) + len(unmanaged_list))
-        for row, mod in enumerate(mods):
+        for row, mod in enumerate(display_mods):
             is_on = mod.id in enabled_set
 
             chk = QTableWidgetItem()
@@ -638,20 +846,18 @@ class MainWindow(QMainWindow):
 
             item_ver = QTableWidgetItem(mod.version or "-")
             item_ver.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+            upd = self._update_cache.get(mod.id)
+            if upd and is_update_available(upd.get("v", ""), upd.get("f"), mod.version or "", mod.nexus_file_id):
+                item_ver.setForeground(QColor("#F2C94C"))
+                item_ver.setIcon(mdi_icon("alert", "#F2C94C"))
+                item_ver.setToolTip(self.t.tr("update.available_tip", version=upd.get("v") or "?"))
 
-            # Priority index
-            prio_str = "-"
-            for c in mod.components:
-                if c.kind == "pak":
-                    key = f"{mod.id}:{c.name}"
-                    if key in prof.pak_order:
-                        prio_str = str(prof.pak_order.index(key) + 1)
-                    break
-            item_prio = QTableWidgetItem(prio_str)
+            # Order (0-based position in the profile's mod order)
+            item_prio = QTableWidgetItem(str(order_of[mod.id]))
             item_prio.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
             # Status dot
-            dot_text, dot_color = self._compute_mod_status(mod, deployed_by_mod.get(mod.id, []))
+            dot_text, dot_color = status_of[mod.id]
             item_status = QTableWidgetItem(dot_text)
             item_status.setForeground(QColor(dot_color))
             item_status.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
@@ -707,6 +913,113 @@ class MainWindow(QMainWindow):
         self._suppress_table_signals = False
         self._update_status_bar(len(enabled_set) + len(unmanaged_list), len(mods) + len(unmanaged_list), prof.name)
         self._refresh_right_tabs(mods, manifest)
+        self._apply_filter()
+
+    def _on_header_clicked(self, col: int) -> None:
+        """Click a title: ascending, click again: descending, third click: back to profile order."""
+        if self._sort_col != col:
+            self._sort_col, self._sort_desc = col, False
+        elif not self._sort_desc:
+            self._sort_desc = True
+        else:
+            self._sort_col, self._sort_desc = None, False
+        hdr = self.table.horizontalHeader()
+        if self._sort_col is None:
+            hdr.setSortIndicatorShown(False)
+        else:
+            hdr.setSortIndicatorShown(True)
+            hdr.setSortIndicator(
+                col, Qt.SortOrder.DescendingOrder if self._sort_desc else Qt.SortOrder.AscendingOrder
+            )
+        self.refresh_all()
+        self.table.clearSelection()
+
+    def _apply_filter(self, *_args) -> None:
+        """Hide rows not matching the filter text: left list by mod name, right tabs by their mod."""
+        needle = self.edit_filter.text().strip().lower() if hasattr(self, "edit_filter") else ""
+        visible_ids: set[str] = set()
+        for r in range(self.table.rowCount()):
+            chk, name = self.table.item(r, 0), self.table.item(r, 1)
+            show = not needle or (name is not None and needle in name.text().lower())
+            self.table.setRowHidden(r, not show)
+            if show and chk is not None:
+                visible_ids.add(str(chk.data(Qt.ItemDataRole.UserRole)))
+
+        for r in range(self.tab_ue4ss.rowCount()):
+            chk, name = self.tab_ue4ss.item(r, 0), self.tab_ue4ss.item(r, 1)
+            payload = chk.data(Qt.ItemDataRole.UserRole) if chk is not None else None
+            if isinstance(payload, tuple) and len(payload) >= 2 and payload[0] == "managed":
+                show = not needle or payload[1] in visible_ids
+            else:
+                show = not needle or (name is not None and needle in name.text().lower())
+            self.tab_ue4ss.setRowHidden(r, not show)
+
+        for r in range(self.tab_paks.rowCount()):
+            chk, name = self.tab_paks.item(r, 0), self.tab_paks.item(r, 1)
+            owner = chk.data(Qt.ItemDataRole.UserRole) if chk is not None else None
+            if isinstance(owner, tuple) and len(owner) >= 2:
+                show = not needle or owner[0] in visible_ids
+            else:
+                show = not needle or (name is not None and needle in name.text().lower())
+            self.tab_paks.setRowHidden(r, not show)
+
+        for r in range(self.tab_downloads.rowCount()):
+            name = self.tab_downloads.item(r, 0)
+            show = not needle or name is None or needle in name.text().lower()
+            self.tab_downloads.setRowHidden(r, not show)
+
+    def _managed_order_ids(self) -> list[str]:
+        return [m.id for m in _ordered_mods(self.store.list_mods(), self.store.load_profile())]
+
+    def _on_mod_row_moved(self, src: int, dst: int) -> None:
+        ids = self._managed_order_ids()
+        a, b = self.table.item(src, 0), self.table.item(dst, 0)
+        src_id = str(a.data(Qt.ItemDataRole.UserRole)) if a is not None else ""
+        dst_id = str(b.data(Qt.ItemDataRole.UserRole)) if b is not None else ""
+        if src_id not in ids:
+            return
+        # Dropping on an unmanaged row sends the mod to the end of the managed order.
+        self._move_mod_to(src_id, ids.index(dst_id) if dst_id in ids else len(ids) - 1)
+
+    def _move_mod_to(self, mod_id: str, new_index: int) -> None:
+        """Move a managed mod in the left-panel order, then rebuild pak + UE4SS order from it."""
+        prof = self.store.load_profile()
+        mods = self.store.list_mods()
+        ids = [m.id for m in _ordered_mods(mods, prof)]
+        if mod_id not in ids:
+            return
+        new_index = max(0, min(len(ids) - 1, new_index))
+        old_index = ids.index(mod_id)
+        if new_index == old_index:
+            return
+        ids.insert(new_index, ids.pop(old_index))
+        prof.mod_order = ids
+        by_id = {m.id: m for m in mods}
+        prof.pak_order = [
+            f"{mid}:{c.name}" for mid in ids if mid in by_id for c in by_id[mid].components if c.kind == "pak"
+        ]
+        prof.ue4ss_order = [
+            c.name for mid in ids if mid in by_id for c in by_id[mid].components if c.kind == "ue4ss_mod"
+        ]
+        self.store.save_profile(prof)
+        mgr = self._manager()
+        if mgr is not None:
+            try:
+                mgr.apply_profile(prof)
+            except DeployError as exc:
+                QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        self.refresh_all()
+
+    def _ctx_set_mod_order(self, mod_id: str) -> None:
+        ids = self._managed_order_ids()
+        if mod_id not in ids:
+            return
+        cur = ids.index(mod_id)
+        val, ok = QInputDialog.getInt(
+            self, self.t.tr("app.title"), self.t.tr("ctx.set_order_prompt"), cur, 0, len(ids) - 1
+        )
+        if ok:
+            self._move_mod_to(mod_id, val)
 
     def _refresh_right_tabs(self, mods: list[ModRecord], manifest) -> None:
         self._suppress_right_signals = True
@@ -739,7 +1052,7 @@ class MainWindow(QMainWindow):
 
         unmanaged_tip = self.t.tr("status.unmanaged_tooltip")
         bi_font = _bold_italic_font(self.tab_ue4ss.font())
-        keybinds_tip = "Core UE4SS hotkey engine required by Lua mods (cannot be disabled)."
+        keybinds_tip = "Core UE4SS hotkeys (always on)"
 
         show_core = bool(self.store.load_settings().get("show_ue4ss_core", False))
 
@@ -848,6 +1161,7 @@ class MainWindow(QMainWindow):
             it_name.setForeground(QColor(txt_col))
             it_name.setData(Qt.ItemDataRole.UserRole, str(fpath) if fpath else "")
             it_st = QTableWidgetItem(state)
+            it_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_st.setForeground(QColor(st_col))
             if is_bi:
                 it_name.setFont(bi_font)
@@ -919,6 +1233,15 @@ class MainWindow(QMainWindow):
                 return cand
         return None
 
+    def _find_managed_mod_config(self, mod: ModRecord) -> Optional[Path]:
+        mdir = self.store.mod_dir(mod.id)
+        for c in mod.components:
+            if c.kind == "ue4ss_mod":
+                cfg = self._find_mod_config_file(mdir / c.store_rel)
+                if cfg is not None:
+                    return cfg
+        return None
+
     def _resolve_nexus_mod_id(self, mod: Optional[ModRecord]) -> Optional[int]:
         if mod is None:
             return None
@@ -970,9 +1293,16 @@ class MainWindow(QMainWindow):
 
     def _on_ue4ss_context_menu(self, pos) -> None:
         row = self.tab_ue4ss.rowAt(pos.y())
-        if row < 0:
-            row = self.tab_ue4ss.currentRow()
-        if row < 0:
+        sel_items = self._ue4ss_items(self._tab_rows(self.tab_ue4ss)) if row >= 0 else []
+        if row < 0 or len(sel_items) > 1:
+            menu = QMenu(self)
+            if len(sel_items) > 1:
+                self._add_toggle_actions(menu, sel_items, True, self._set_ue4ss_enabled)
+            else:
+                self.tab_ue4ss.clearSelection()
+                self._add_toggle_actions(menu, self._ue4ss_items(), False, self._set_ue4ss_enabled)
+            if menu.actions():
+                menu.exec(self.tab_ue4ss.viewport().mapToGlobal(pos))
             return
         chk_item = self.tab_ue4ss.item(row, 0)
         item = self.tab_ue4ss.item(row, 1)
@@ -1008,15 +1338,28 @@ class MainWindow(QMainWindow):
             if mod is not None and nid is not None:
                 self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
 
+        all_items = self._ue4ss_items()
+        if all_items:
+            menu.addSeparator()
+            self._add_toggle_actions(menu, all_items, False, self._set_ue4ss_enabled)
         if menu.actions():
             menu.exec(self.tab_ue4ss.viewport().mapToGlobal(pos))
 
     def _on_paks_context_menu(self, pos) -> None:
-        row = self.tab_paks.currentRow()
-        if row < 0:
+        row = self.tab_paks.rowAt(pos.y())
+        sel_items = self._pak_items(self._tab_rows(self.tab_paks)) if row >= 0 else []
+        if row < 0 or len(sel_items) > 1:
+            menu = QMenu(self)
+            if len(sel_items) > 1:
+                self._add_toggle_actions(menu, sel_items, True, self._set_paks_enabled)
+            else:
+                self.tab_paks.clearSelection()
+                self._add_toggle_actions(menu, self._pak_items(), False, self._set_paks_enabled)
+            if menu.actions():
+                menu.exec(self.tab_paks.viewport().mapToGlobal(pos))
             return
         chk_item = self.tab_paks.item(row, 0)
-        item = self.tab_paks.item(row, 2)
+        item = self.tab_paks.item(row, 1)
         if not item:
             return
         raw_path = item.data(Qt.ItemDataRole.UserRole)
@@ -1042,6 +1385,22 @@ class MainWindow(QMainWindow):
             if mod is not None and nid is not None:
                 self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
 
+        if row in self._movable_pak_rows():
+            menu.addSeparator()
+            act_up = QAction(self.t.tr("ctx.move_up"), self)
+            act_down = QAction(self.t.tr("ctx.move_down"), self)
+            act_order = QAction(self.t.tr("ctx.set_order"), self)
+            act_up.triggered.connect(lambda: self._on_pak_row_moved(row, row - 1))
+            act_down.triggered.connect(lambda: self._on_pak_row_moved(row, row + 1))
+            act_order.triggered.connect(lambda: self._ctx_set_pak_order(row))
+            menu.addAction(act_up)
+            menu.addAction(act_down)
+            menu.addAction(act_order)
+
+        all_items = self._pak_items()
+        if all_items:
+            menu.addSeparator()
+            self._add_toggle_actions(menu, all_items, False, self._set_paks_enabled)
         if menu.actions():
             menu.exec(self.tab_paks.viewport().mapToGlobal(pos))
 
@@ -1089,6 +1448,7 @@ class MainWindow(QMainWindow):
                 config_conflict_paks.add(cpak.lower())
         mod_by_id = {m.id: m for m in mods}
 
+        self._pak_rows = [(owner, folder_lbl, checked) for _p, folder_lbl, checked, owner, _u in entries]
         self.tab_paks.setRowCount(len(entries))
         for r, (pname, folder_lbl, checked, owner, is_unmanaged) in enumerate(entries):
             chk = QTableWidgetItem()
@@ -1100,11 +1460,14 @@ class MainWindow(QMainWindow):
                 chk.setFlags(Qt.ItemFlag.ItemIsEnabled | Qt.ItemFlag.ItemIsSelectable)
                 chk.setCheckState(Qt.CheckState.Checked)
 
-            it_rank = QTableWidgetItem(str(r + 1) if checked else "-")
+            it_rank = QTableWidgetItem(str(r) if checked else "-")
             it_rank.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
 
-            display = pname if folder_lbl == "~mods" else f"[LogicMods] {pname}"
+            shown = owner[1] if owner is not None else pname  # managed paks show their original name
+            display = shown if folder_lbl == "~mods" else f"[LogicMods] {shown}"
             it_name = QTableWidgetItem(display)
+            if shown != pname:
+                it_name.setToolTip(self.t.tr("pak.deployed_as", name=pname))
             if checked and self.game is not None:
                 p_folder = self.game.logic_mods_dir if folder_lbl == "LogicMods" else self.game.mods_pak_dir
                 it_name.setData(Qt.ItemDataRole.UserRole, str(p_folder / pname))
@@ -1145,9 +1508,54 @@ class MainWindow(QMainWindow):
                     it.setToolTip(unmanaged_tip)
 
             self.tab_paks.setItem(r, 0, chk)
-            self.tab_paks.setItem(r, 1, it_rank)
-            self.tab_paks.setItem(r, 2, it_name)
+            self.tab_paks.setItem(r, 1, it_name)
+            self.tab_paks.setItem(r, 2, it_rank)
             self.tab_paks.setItem(r, 3, it_st)
+
+    def _movable_pak_rows(self) -> list[int]:
+        """Displayed rows of managed, enabled ~mods paks (the ones whose order WMM controls)."""
+        return [
+            i for i, (owner, folder, checked) in enumerate(self._pak_rows)
+            if owner is not None and checked and folder == "~mods"
+        ]
+
+    def _ctx_set_pak_order(self, row: int) -> None:
+        movable = self._movable_pak_rows()
+        if row not in movable:
+            return
+        val, ok = QInputDialog.getInt(
+            self, self.t.tr("app.title"), self.t.tr("ctx.set_order_prompt"), row, movable[0], movable[-1]
+        )
+        if ok:
+            self._on_pak_row_moved(row, val)
+
+    def _on_pak_row_moved(self, src: int, dst: int) -> None:
+        """Reorder paks only (pak_order); the left-panel mod order is left untouched."""
+        movable = self._movable_pak_rows()
+        if src not in movable:
+            return
+        dst = max(movable[0], min(movable[-1], dst))
+        if dst == src:
+            return
+        keys = [f"{self._pak_rows[i][0][0]}:{self._pak_rows[i][0][1]}" for i in movable]
+        key = keys.pop(movable.index(src))
+        if dst > src:
+            pos = sum(1 for m in movable if m <= dst) - 1
+        else:
+            pos = sum(1 for m in movable if m < dst)
+        keys.insert(pos, key)
+        mgr = self._manager()
+        if mgr is None:
+            return
+        prof = self.store.load_profile()
+        prof.pak_order = keys + [k for k in prof.pak_order if k not in set(keys)]
+        self.store.save_profile(prof)
+        try:
+            mgr.apply_profile(prof)
+            self._log(f"[Pak] order: {key} -> {pos}")
+        except DeployError as exc:
+            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        self.refresh_all()
 
     def _on_pak_item_changed(self, item: QTableWidgetItem) -> None:
         if self._suppress_right_signals or item.column() != 0:
@@ -1224,6 +1632,7 @@ class MainWindow(QMainWindow):
             it_size = QTableWidgetItem(size_str)
             it_size.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             it_state = QTableWidgetItem("✔ Installed" if is_inst else "Unpacked: No")
+            it_state.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             it_state.setForeground(QColor("#4CAF7D" if is_inst else "#AEB3BE"))
             self.tab_downloads.setItem(r, 0, it_file)
             self.tab_downloads.setItem(r, 1, it_size)
@@ -1237,28 +1646,37 @@ class MainWindow(QMainWindow):
                 self._install_path(p)
 
     def _on_downloads_context_menu(self, pos) -> None:
-        row = self.tab_downloads.currentRow()
-        if row < 0:
-            return
-        item = self.tab_downloads.item(row, 0)
-        if not item or not item.data(Qt.ItemDataRole.UserRole):
-            return
-        p = Path(item.data(Qt.ItemDataRole.UserRole))
         menu = QMenu(self)
-        act_inst = QAction(self.t.tr("ctx.install_download"), self)
-        act_open = QAction(self.t.tr("ctx.open_folder"), self)
-        act_del = QAction(self.t.tr("ctx.delete_download"), self)
-        act_inst.triggered.connect(lambda: self._install_path(p))
-        act_open.triggered.connect(lambda: self._open_path(p.parent))
-        act_del.triggered.connect(lambda: self._delete_download(p))
-        menu.addAction(act_inst)
-        menu.addAction(act_open)
-        dl_nid = parse_nexus_mod_id_from_filename(p.name)
-        if dl_nid is not None:
-            self._append_nexus_menu_actions(menu, dl_nid, p.stem)
-        menu.addSeparator()
-        menu.addAction(act_del)
-        menu.exec(self.tab_downloads.viewport().mapToGlobal(pos))
+        row = self.tab_downloads.rowAt(pos.y())
+        sel_paths = self._download_paths(self._tab_rows(self.tab_downloads)) if row >= 0 else []
+        if len(sel_paths) > 1:
+            act = QAction(self.t.tr("ctx.delete_selected_downloads"), self)
+            act.triggered.connect(lambda: self._delete_downloads(sel_paths))
+            menu.addAction(act)
+        elif sel_paths:
+            p = sel_paths[0]
+            act_inst = QAction(self.t.tr("ctx.install_download"), self)
+            act_open = QAction(self.t.tr("ctx.open_folder"), self)
+            act_del = QAction(self.t.tr("ctx.delete_download"), self)
+            act_inst.triggered.connect(lambda: self._install_path(p))
+            act_open.triggered.connect(lambda: self._open_path(p.parent))
+            act_del.triggered.connect(lambda: self._delete_download(p))
+            menu.addAction(act_inst)
+            menu.addAction(act_open)
+            dl_nid = parse_nexus_mod_id_from_filename(p.name)
+            if dl_nid is not None:
+                self._append_nexus_menu_actions(menu, dl_nid, p.stem)
+            menu.addSeparator()
+            menu.addAction(act_del)
+        all_paths = self._download_paths()
+        if all_paths:
+            if menu.actions():
+                menu.addSeparator()
+            act_all = QAction(self.t.tr("ctx.delete_all_downloads"), self)
+            act_all.triggered.connect(lambda: self._delete_downloads(all_paths))
+            menu.addAction(act_all)
+        if menu.actions():
+            menu.exec(self.tab_downloads.viewport().mapToGlobal(pos))
 
     def _delete_download(self, archive_path: Path) -> None:
         ans = QMessageBox.question(
@@ -1314,6 +1732,220 @@ class MainWindow(QMainWindow):
         item = self.table.item(rows[0].row(), 0)
         return item.data(Qt.ItemDataRole.UserRole) if item else None
 
+    def _selected_managed_ids(self) -> list[str]:
+        ids: list[str] = []
+        for idx in self.table.selectionModel().selectedRows():
+            item = self.table.item(idx.row(), 0)
+            mid = item.data(Qt.ItemDataRole.UserRole) if item else None
+            if mid and mid not in self.unmanaged_mods and mid not in ids:
+                ids.append(mid)
+        return ids
+
+    def _disable_mods(self, ids: list[str]) -> None:
+        self._set_mods_enabled(ids, False)
+
+    def _enable_mods(self, ids: list[str]) -> None:
+        self._set_mods_enabled(ids, True)
+
+    def _set_mods_enabled(self, ids: list[str], on: bool) -> None:
+        """Enable or disable several mods with a single redeploy."""
+        mgr = self._manager()
+        if mgr is None or not ids:
+            return
+        prof = self.store.load_profile()
+        if on:
+            prof.enabled_mods = list(prof.enabled_mods) + [m for m in ids if m not in prof.enabled_mods]
+        else:
+            drop = set(ids)
+            prof.enabled_mods = [m for m in prof.enabled_mods if m not in drop]
+        self.store.save_profile(prof)
+        try:
+            mgr.apply_profile(prof)
+            self._log(f"{'Enabled' if on else 'Disabled'} {len(ids)} mod(s)")
+        except DeployError as exc:
+            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        self.refresh_all()
+        if on:
+            self._notify_restart_if_game_running()
+
+    def _add_bulk_actions(self, menu: QMenu, scope_ids: list[str], selected: bool) -> None:
+        """Enable/Disable (all|selected) entries for the given mod ids, only where they would change something."""
+        enabled = set(self.store.load_profile().enabled_mods)
+        off = [m for m in scope_ids if m not in enabled]
+        on = [m for m in scope_ids if m in enabled]
+        key = "selected" if selected else "all"
+        if off:
+            a = QAction(self.t.tr(f"ctx.enable_{key}"), self)
+            a.triggered.connect(lambda: self._enable_mods(off))
+            menu.addAction(a)
+        if on:
+            a = QAction(self.t.tr(f"ctx.disable_{key}"), self)
+            a.triggered.connect(lambda: self._disable_mods(on))
+            menu.addAction(a)
+
+    def _on_mod_row_activated(self, row: int, col: int) -> None:
+        """Double-click a mod row (not the checkbox) to open its details."""
+        if col == 0:
+            return
+        item = self.table.item(row, 0)
+        mid = item.data(Qt.ItemDataRole.UserRole) if item else None
+        if mid:
+            self._show_mod_details(str(mid))
+
+    def _on_mods_space(self) -> None:
+        ids = self._selected_managed_ids()
+        if not ids:
+            return
+        enabled = set(self.store.load_profile().enabled_mods)
+        self._set_mods_enabled(ids, ids[0] not in enabled)
+
+    # --- right panel: selection helpers, bulk toggles ---
+
+    def _tab_rows(self, tbl: QTableWidget) -> list[int]:
+        rows = sorted({i.row() for i in tbl.selectionModel().selectedRows() if not tbl.isRowHidden(i.row())})
+        if not rows and tbl.currentRow() >= 0:
+            rows = [tbl.currentRow()]
+        return rows
+
+    def _ue4ss_items(self, rows: Optional[list[int]] = None) -> list[tuple[tuple, bool]]:
+        """(payload, checked) for toggleable UE4SS rows; rows=None means every row."""
+        out: list[tuple[tuple, bool]] = []
+        for r in rows if rows is not None else range(self.tab_ue4ss.rowCount()):
+            chk = self.tab_ue4ss.item(r, 0)
+            pl = chk.data(Qt.ItemDataRole.UserRole) if chk is not None else None
+            if isinstance(pl, tuple) and pl and pl[0] in ("managed", "unmanaged") and (chk.flags() & Qt.ItemFlag.ItemIsEnabled):
+                out.append((pl, chk.checkState() == Qt.CheckState.Checked))
+        return out
+
+    def _pak_items(self, rows: Optional[list[int]] = None) -> list[tuple[tuple, bool]]:
+        """((mod_id, original pak name), checked) for managed paks; rows=None means every row."""
+        out: list[tuple[tuple, bool]] = []
+        for r in rows if rows is not None else range(self.tab_paks.rowCount()):
+            chk = self.tab_paks.item(r, 0)
+            owner = chk.data(Qt.ItemDataRole.UserRole) if chk is not None else None
+            if isinstance(owner, tuple) and len(owner) >= 2 and (chk.flags() & Qt.ItemFlag.ItemIsEnabled):
+                out.append((owner, chk.checkState() == Qt.CheckState.Checked))
+        return out
+
+    def _add_toggle_actions(self, menu: QMenu, items: list[tuple[object, bool]], selected: bool, apply_fn) -> None:
+        keys_on = [k for k, c in items if c]
+        keys_off = [k for k, c in items if not c]
+        key = "selected" if selected else "all"
+        if keys_off:
+            a = QAction(self.t.tr(f"ctx.enable_{key}"), self)
+            a.triggered.connect(lambda: apply_fn(keys_off, True))
+            menu.addAction(a)
+        if keys_on:
+            a = QAction(self.t.tr(f"ctx.disable_{key}"), self)
+            a.triggered.connect(lambda: apply_fn(keys_on, False))
+            menu.addAction(a)
+
+    def _set_paks_enabled(self, owners: list[tuple], on: bool) -> None:
+        mgr = self._manager()
+        if mgr is None or not owners:
+            return
+        by_mod: dict[str, set[str]] = {}
+        for owner in owners:
+            by_mod.setdefault(owner[0], set()).add(owner[1])
+        for mid, names in by_mod.items():
+            mod = self.store.load_mod(mid)
+            if mod is None:
+                continue
+            for c in mod.components:
+                if c.kind == "pak" and c.name in names:
+                    c.selected = on
+            self.store.save_mod(mod)
+        try:
+            mgr.apply_profile()
+            self._log(f"[Pak] {'enabled' if on else 'disabled'} {len(owners)} pak(s)")
+        except DeployError as exc:
+            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        self.refresh_all()
+        if on:
+            self._notify_restart_if_game_running()
+
+    def _set_ue4ss_enabled(self, payloads: list[tuple], on: bool) -> None:
+        if self.game is None or not payloads:
+            return
+        procs = running_game_processes(self.plat)
+        if procs and not self._game_unlocked:
+            QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("err.game_running", procs=", ".join(procs)))
+            return
+        managed: dict[str, set[str]] = {}
+        loose: list[str] = []
+        for pl in payloads:
+            if pl[0] == "managed":
+                managed.setdefault(pl[1], set()).add(pl[2])
+            else:
+                loose.append(str(pl[1]))
+        if on and any(n.lower() == "splitscreenmod" for n in loose):
+            ans = QMessageBox.warning(
+                self,
+                self.t.tr("app.title"),
+                self.t.tr("warn.splitscreen_fps"),
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                loose = [n for n in loose if n.lower() != "splitscreenmod"]
+        mgr = self._manager()
+        try:
+            if managed and mgr is not None:
+                for mid, names in managed.items():
+                    mod = self.store.load_mod(mid)
+                    if mod is None:
+                        continue
+                    for c in mod.components:
+                        if c.kind == "ue4ss_mod" and c.name in names:
+                            c.selected = on
+                    self.store.save_mod(mod)
+                mgr.apply_profile()
+            if loose:
+                write_mods_txt(self.game.ue4ss_mods_txt, [(n, on) for n in loose], preserve_unmanaged=True)
+            self._log(f"[UE4SS] {'enabled' if on else 'disabled'} {len(managed) + len(loose)} entr(ies)")
+        except DeployError as exc:
+            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        self.refresh_all()
+        if on:
+            self._notify_restart_if_game_running()
+
+    def _on_ue4ss_space(self) -> None:
+        items = self._ue4ss_items(self._tab_rows(self.tab_ue4ss))
+        if items:
+            self._set_ue4ss_enabled([k for k, _ in items], not items[0][1])
+
+    def _on_paks_space(self) -> None:
+        items = self._pak_items(self._tab_rows(self.tab_paks))
+        if items:
+            self._set_paks_enabled([k for k, _ in items], not items[0][1])
+
+    def _download_paths(self, rows: Optional[list[int]] = None) -> list[Path]:
+        out: list[Path] = []
+        for r in rows if rows is not None else range(self.tab_downloads.rowCount()):
+            it = self.tab_downloads.item(r, 0)
+            raw = it.data(Qt.ItemDataRole.UserRole) if it is not None else None
+            if raw:
+                out.append(Path(raw))
+        return out
+
+    def _delete_downloads(self, paths: list[Path]) -> None:
+        paths = [p for p in paths if p.is_file()]
+        if not paths:
+            return
+        ans = QMessageBox.question(
+            self, self.t.tr("app.title"), self.t.tr("ctx.confirm_delete_downloads", count=len(paths))
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        for p in paths:
+            try:
+                p.unlink(missing_ok=True)
+                self._log(f"Deleted download: {p.name}")
+            except OSError as exc:
+                QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+                break
+        self.refresh_all()
+
     def _on_selection_changed(self) -> None:
         # Right pane now shows live installed UE4SS / Paks / Downloads tabs;
         # per-mod details are shown via right-click -> Details...
@@ -1340,8 +1972,20 @@ class MainWindow(QMainWindow):
             self.t,
             on_visit_nexus=self._visit_nexus_page,
             on_endorse_nexus=self._endorse_nexus_mod,
+            on_rename=lambda new: self._rename_mod(mod_id, new),
             parent=self,
         ).exec()
+
+    def _rename_mod(self, mod_id: str, new_name: str) -> None:
+        """Change the display name only; the store folder id, files and order stay as they are."""
+        mod = self.store.load_mod(mod_id)
+        if mod is None or not new_name.strip():
+            return
+        old = mod.name
+        mod.name = new_name.strip()
+        self.store.save_mod(mod)
+        self._log(f"Renamed {old} -> {mod.name}")
+        self.refresh_all()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if self._suppress_table_signals or item.column() != 0:
@@ -1431,6 +2075,9 @@ class MainWindow(QMainWindow):
             return
 
         resolved_nid = nexus_mod_id if nexus_mod_id is not None else parse_nexus_mod_id_from_filename(path.name)
+        parsed_nx = parse_nexus_archive_name(path.name)
+        if parsed_nx is not None and not version:
+            version = parsed_nx[2]
         if resolved_nid is not None:
             existing = next(
                 (m for m in self.store.list_mods() if self._resolve_nexus_mod_id(m) == resolved_nid),
@@ -1509,6 +2156,7 @@ class MainWindow(QMainWindow):
         self._dl_progress[dl_id] = {"name": uri.split("?")[0], "pct": -1, "speed": ""}
         self.right_tabs.setCurrentWidget(self.tab_downloads)
         self._refresh_downloads_tab(self.store.list_mods())
+        self._apply_filter()
         self.statusBar().showMessage(self.t.tr("download.in_progress", name=uri.split("?")[0]))
         self._log(f"Downloading: {uri.split('?')[0]}")
 
@@ -1519,6 +2167,7 @@ class MainWindow(QMainWindow):
             if did in self._dl_progress:
                 self._dl_progress[did] = {"name": fname, "pct": pct, "speed": spd}
                 self._refresh_downloads_tab(self.store.list_mods())
+                self._apply_filter()
                 self.statusBar().showMessage(f"Downloading {fname} ({pct}% — {spd})" if pct >= 0 else f"Downloading {fname} ({spd})")
 
         def _on_ok(did: int, dl_path_str: str, mod_name, mod_ver: str, nx_mod_id) -> None:
@@ -1649,10 +2298,18 @@ class MainWindow(QMainWindow):
     # --- Context menu (Open folder, Move up/down, Update, Uninstall) ---
 
     def _on_table_context_menu(self, pos) -> None:
+        sel_ids = self._selected_managed_ids()
+        menu = QMenu(self)
+        if len(sel_ids) > 1:
+            self._add_bulk_actions(menu, sel_ids, selected=True)
+            menu.exec(self.table.viewport().mapToGlobal(pos))
+            return
         mod_id = self._selected_mod_id()
         if not mod_id:
+            self._add_bulk_actions(menu, self._managed_order_ids(), selected=False)
+            if menu.actions():
+                menu.exec(self.table.viewport().mapToGlobal(pos))
             return
-        menu = QMenu(self)
         if mod_id in self.unmanaged_mods:
             u = self.unmanaged_mods[mod_id]
             act_adopt = QAction(self.t.tr("ctx.adopt"), self)
@@ -1673,23 +2330,34 @@ class MainWindow(QMainWindow):
 
         act_details.triggered.connect(lambda: self._show_mod_details(mod_id))
         act_open.triggered.connect(lambda: self._ctx_open_folder(mod_id))
-        act_up.triggered.connect(lambda: self._ctx_move_pak(mod_id, -1))
-        act_down.triggered.connect(lambda: self._ctx_move_pak(mod_id, 1))
+        act_up.triggered.connect(lambda: self._ctx_move_mod(mod_id, -1))
+        act_down.triggered.connect(lambda: self._ctx_move_mod(mod_id, 1))
+        act_order = QAction(self.t.tr("ctx.set_order"), self)
+        act_order.triggered.connect(lambda: self._ctx_set_mod_order(mod_id))
         act_update.triggered.connect(lambda: self._ctx_update(mod_id))
         act_uninst.triggered.connect(lambda: self._ctx_uninstall(mod_id))
 
         menu.addAction(act_details)
         menu.addAction(act_open)
         mod = self.store.load_mod(mod_id)
+        if mod is not None:
+            cfg = self._find_managed_mod_config(mod)
+            if cfg is not None:
+                act_cfg = QAction(self.t.tr("ctx.open_config"), self)
+                act_cfg.triggered.connect(lambda: self._open_path(cfg))
+                menu.addAction(act_cfg)
         nid = self._resolve_nexus_mod_id(mod)
         if mod is not None and nid is not None:
             self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
         menu.addSeparator()
         menu.addAction(act_up)
         menu.addAction(act_down)
+        menu.addAction(act_order)
         menu.addSeparator()
         menu.addAction(act_update)
         menu.addAction(act_uninst)
+        menu.addSeparator()
+        self._add_bulk_actions(menu, self._managed_order_ids(), selected=False)
         menu.exec(self.table.viewport().mapToGlobal(pos))
 
     def _open_path(self, target: Path) -> None:
@@ -1714,39 +2382,10 @@ class MainWindow(QMainWindow):
     def _ctx_open_folder(self, mod_id: str) -> None:
         self._open_path(self.store.mod_dir(mod_id))
 
-    def _ctx_move_pak(self, mod_id: str, delta: int) -> None:
-        mgr = self._manager()
-        if mgr is None:
-            return
-        mod = self.store.load_mod(mod_id)
-        if mod is None:
-            return
-        pak_keys = [f"{mod.id}:{c.name}" for c in mod.components if c.kind == "pak"]
-        if not pak_keys:
-            return
-        prof = self.store.load_profile()
-        # Ensure all enabled paks are in pak_order
-        for m in self.store.list_mods():
-            if m.id in prof.enabled_mods:
-                for c in m.components:
-                    if c.kind == "pak":
-                        k = f"{m.id}:{c.name}"
-                        if k not in prof.pak_order:
-                            prof.pak_order.append(k)
-        key = pak_keys[0]
-        if key not in prof.pak_order:
-            return
-        idx = prof.pak_order.index(key)
-        new_idx = max(0, min(len(prof.pak_order) - 1, idx + delta))
-        if new_idx == idx:
-            return
-        prof.pak_order.insert(new_idx, prof.pak_order.pop(idx))
-        self.store.save_profile(prof)
-        try:
-            mgr.apply_profile(prof)
-        except DeployError as exc:
-            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
-        self.refresh_all()
+    def _ctx_move_mod(self, mod_id: str, delta: int) -> None:
+        ids = self._managed_order_ids()
+        if mod_id in ids:
+            self._move_mod_to(mod_id, ids.index(mod_id) + delta)
 
     def _ctx_update(self, mod_id: str) -> None:
         mgr = self._manager()

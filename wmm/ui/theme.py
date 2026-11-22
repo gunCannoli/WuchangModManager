@@ -15,8 +15,13 @@ QMainWindow, QDialog {{
 QToolBar {{
     background-color: #202226;
     border-bottom: 1px solid #2E3138;
-    spacing: 6px;
+    spacing: 8px;
     padding: 4px 8px;
+}}
+QToolBar::separator {{
+    background-color: #3A3E47;
+    width: 1px;
+    margin: 4px 0px;
 }}
 QPushButton, QToolButton {{
     background-color: #2A2D34;
@@ -52,16 +57,13 @@ QTableWidget, QTreeWidget, QListWidget, QTextEdit, QPlainTextEdit {{
     border: 1px solid #2E3138;
     gridline-color: #262930;
     selection-background-color: #2C313C;
-    selection-color: #FFFFFF;
     outline: 0;
 }}
 QTableWidget::item:selected, QTreeWidget::item:selected, QListWidget::item:selected {{
     background-color: #2C313C;
-    color: #FFFFFF;
 }}
 QTableWidget::item:selected:!active, QTreeWidget::item:selected:!active, QListWidget::item:selected:!active {{
     background-color: #22262E;
-    color: #D8DCE3;
 }}
 QTableWidget::item:focus, QTreeWidget::item:focus, QListWidget::item:focus {{
     outline: none;

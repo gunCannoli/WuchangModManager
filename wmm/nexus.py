@@ -30,8 +30,78 @@ _NEXUS_DASH_ID_RE = re.compile(r"-(?P<id>\d{1,7})-(?:v?\d+(?:[._-]\d+)+|\d{9,})"
 _NEXUS_SPACE_ID_RE = re.compile(r"\s(?P<id>\d{1,7})\s+v?\d+\.\d+")
 
 
+def sanitize_url(url: str) -> str:
+    """Percent-encode spaces and other unsafe characters in a CDN URL (existing %XX escapes are kept)."""
+    parts = urllib.parse.urlsplit(url.strip())
+    safe = "/%:@!$&'()*+,;=-._~"
+    return urllib.parse.urlunsplit(
+        (
+            parts.scheme,
+            parts.netloc,
+            urllib.parse.quote(parts.path, safe=safe),
+            urllib.parse.quote(parts.query, safe=safe + "?"),
+            urllib.parse.quote(parts.fragment, safe=safe + "?"),
+        )
+    )
+
+
+def version_key(v: str) -> tuple:
+    """Natural sort key for version strings (1.2.10 > 1.2.9; leading v ignored)."""
+    return tuple((0, int(p)) if p.isdigit() else (1, p.lower()) for p in re.findall(r"\d+|[A-Za-z]+", v or ""))
+
+
+def latest_main_file(files_json: dict[str, Any]) -> Optional[dict[str, Any]]:
+    """Newest MAIN file (falls back to any file) from a files.json response."""
+    files = files_json.get("files", [])
+    main = [f for f in files if f.get("category_name") == "MAIN" or f.get("category_id") == 1] or files
+    if not main:
+        return None
+    return max(main, key=lambda f: int(f.get("file_id", 0)))
+
+
+def is_update_available(
+    latest_version: str,
+    latest_file_id: Optional[int],
+    current_version: str,
+    current_file_id: Optional[int],
+) -> bool:
+    """True when Nexus has a newer main file than the installed one."""
+    lv, cv = version_key(latest_version), version_key(current_version)
+    if current_file_id and latest_file_id:
+        return int(latest_file_id) > int(current_file_id) and (lv != cv or not cv)
+    return bool(lv) and lv > cv
+
+
 def nexus_mod_url(mod_id: int, domain: str = DEFAULT_GAME_DOMAIN) -> str:
     return f"{NEXUS_WEB_BASE}/{domain}/mods/{mod_id}"
+
+
+_NEXUS_MANUAL_RE = re.compile(
+    r"^(?P<name>.+?)\s(?P<id>\d{1,7})\s(?P<ver>\S+)\s\d{4}-\d{2}-\d{2}T\d{2}-\d{2}Z(?:\s\S+)?$"
+)
+_NEXUS_DASH_RE = re.compile(r"^(?P<name>.+?)-(?P<id>\d{1,7})-(?P<ver>\d+(?:-\d+)*)-(?P<ts>\d{9,})$")
+
+
+def parse_nexus_archive_name(filename: str) -> Optional[tuple[str, int, str]]:
+    """Split a Nexus manual-download archive name into (mod name, mod id, version).
+
+    Handles "UncensorMod 411 4 2026-10-11T21-53Z AMLpw5goK" and "Casting Speed x3-386-1-0-1772254188";
+    returns None for any other file name.
+    """
+    stem = Path(filename).stem if Path(filename).suffix.lower() in (".zip", ".7z", ".rar", ".pak") else filename
+    m = _NEXUS_MANUAL_RE.match(stem)
+    if m:
+        ver = m.group("ver")
+    else:
+        m = _NEXUS_DASH_RE.match(stem)
+        if not m:
+            return None
+        ver = m.group("ver").replace("-", ".")
+    name = m.group("name").strip()
+    mod_id = int(m.group("id"))
+    if not name or mod_id <= 0:
+        return None
+    return name, mod_id, ver
 
 
 def parse_nexus_mod_id_from_filename(filename: str) -> Optional[int]:
@@ -212,7 +282,7 @@ class NexusClient:
     ) -> Path:
         dest_dir = Path(dest_dir)
         dest_dir.mkdir(parents=True, exist_ok=True)
-        req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{__version__}"})
+        req = urllib.request.Request(sanitize_url(url), headers={"User-Agent": f"{APP_NAME}/{__version__}"})
         open_fn = self._opener.open if self._opener else urllib.request.urlopen
         with open_fn(req, timeout=120) as resp:
             if not filename:

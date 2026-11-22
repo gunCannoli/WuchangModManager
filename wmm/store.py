@@ -74,6 +74,7 @@ class Profile:
     enabled_mods: list[str] = field(default_factory=list)
     pak_order: list[str] = field(default_factory=list)  # "mod_id:original_name" (low -> high)
     ue4ss_order: list[str] = field(default_factory=list)  # UE4SS mod folder names
+    mod_order: list[str] = field(default_factory=list)  # managed mod ids, 0 = loaded first (left panel order)
 
     def to_dict(self) -> dict:
         return asdict(self)
@@ -85,6 +86,7 @@ class Profile:
             enabled_mods=list(d.get("enabled_mods", [])),
             pak_order=list(d.get("pak_order", [])),
             ue4ss_order=list(d.get("ue4ss_order", [])),
+            mod_order=list(d.get("mod_order", [])),
         )
 
 
@@ -234,6 +236,7 @@ class Store:
             enabled_mods=list(src.enabled_mods),
             pak_order=list(src.pak_order),
             ue4ss_order=list(src.ue4ss_order),
+            mod_order=list(src.mod_order),
         )
         self.save_profile(cloned)
         return cloned

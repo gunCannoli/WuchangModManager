@@ -26,6 +26,50 @@ except ImportError:  # pragma: no cover - non-Windows
     winreg = None
 
 
+def _snapshot_process_names() -> Optional[list[str]]:
+    """Image names of all running processes via ToolHelp32 (about 1 ms, no subprocess); None if unavailable."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class PROCESSENTRY32W(ctypes.Structure):
+            _fields_ = [
+                ("dwSize", wintypes.DWORD),
+                ("cntUsage", wintypes.DWORD),
+                ("th32ProcessID", wintypes.DWORD),
+                ("th32DefaultHeapID", ctypes.c_size_t),
+                ("th32ModuleID", wintypes.DWORD),
+                ("cntThreads", wintypes.DWORD),
+                ("th32ParentProcessID", wintypes.DWORD),
+                ("pcPriClassBase", wintypes.LONG),
+                ("dwFlags", wintypes.DWORD),
+                ("szExeFile", wintypes.WCHAR * 260),
+            ]
+
+        k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+        k32.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+        k32.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(PROCESSENTRY32W)]
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+        if not snap or snap == wintypes.HANDLE(-1).value:
+            return None
+        names: list[str] = []
+        try:
+            entry = PROCESSENTRY32W()
+            entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+            ok = k32.Process32FirstW(snap, ctypes.byref(entry))
+            while ok:
+                names.append(entry.szExeFile)
+                ok = k32.Process32NextW(snap, ctypes.byref(entry))
+        finally:
+            k32.CloseHandle(snap)
+        return names
+    except Exception:
+        return None
+
+
 class _DATA_BLOB(ctypes.Structure):
     _fields_ = [
         ("cbData", ctypes.wintypes.DWORD),
@@ -97,6 +141,16 @@ class WindowsPlatform(Platform):
         if not exe_names:
             return []
         targets = {e.lower() for e in exe_names}
+        native = _snapshot_process_names()
+        if native is not None:
+            found: list[str] = []
+            seen: set[str] = set()
+            for img in native:
+                low = img.lower()
+                if low in targets and low not in seen:
+                    seen.add(low)
+                    found.append(img)
+            return found
         try:
             res = subprocess.run(
                 ["tasklist", "/FO", "CSV", "/NH"],

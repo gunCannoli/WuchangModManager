@@ -34,6 +34,7 @@ class ModDetailsDialog(QDialog):
         translator: Translator,
         on_visit_nexus: Optional[Callable[[int], None]] = None,
         on_endorse_nexus: Optional[Callable[[int, str, str], None]] = None,
+        on_rename: Optional[Callable[[str], None]] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -43,6 +44,7 @@ class ModDetailsDialog(QDialog):
         self.t = translator
         self.on_visit_nexus = on_visit_nexus
         self.on_endorse_nexus = on_endorse_nexus
+        self.on_rename = on_rename
 
         self.nexus_id: Optional[int] = mod.nexus_mod_id
         if self.nexus_id is None and mod.source:
@@ -88,7 +90,23 @@ class ModDetailsDialog(QDialog):
         ov_form.setHorizontalSpacing(8)
         ov_form.setVerticalSpacing(6)
 
-        ov_form.addRow(self._make_label(self.t.tr("col.name")), self._make_readonly_field(self.mod.name))
+        name_row = QHBoxLayout()
+        name_row.setSpacing(6)
+        self.edit_name = QLineEdit(self.mod.name)
+        self.edit_name.setCursorPosition(0)
+        name_row.addWidget(self.edit_name, 1)
+        self.btn_rename = QPushButton(self.t.tr("details.rename"))
+        self.btn_rename.setEnabled(False)
+        self.btn_rename.clicked.connect(self._apply_rename)
+        self.edit_name.textChanged.connect(
+            lambda txt: self.btn_rename.setEnabled(bool(txt.strip()) and txt.strip() != self.mod.name)
+        )
+        self.edit_name.returnPressed.connect(self._apply_rename)
+        if self.on_rename is None:
+            self.edit_name.setReadOnly(True)
+            self.btn_rename.hide()
+        name_row.addWidget(self.btn_rename)
+        ov_form.addRow(self._make_label(self.t.tr("col.name")), name_row)
         ov_form.addRow(self._make_label("ID"), self._make_readonly_field(self.mod.id))
 
         meta_row = QHBoxLayout()
@@ -158,6 +176,15 @@ class ModDetailsDialog(QDialog):
         btn_close.clicked.connect(self.accept)
         footer.addWidget(btn_close)
         root.addLayout(footer)
+
+    def _apply_rename(self) -> None:
+        new = self.edit_name.text().strip()
+        if not new or new == self.mod.name or self.on_rename is None:
+            return
+        self.on_rename(new)
+        self.mod.name = new
+        self.setWindowTitle(f"{new} [{self.mod.badge}]")
+        self.btn_rename.setEnabled(False)
 
     def _build_overrides_text(self) -> str:
         deployed_paks = {

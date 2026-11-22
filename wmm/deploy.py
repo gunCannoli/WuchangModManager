@@ -166,6 +166,13 @@ class Manager:
             if not installable:
                 raise DeployError(f"No installable mod components found in {source.name}")
 
+            # A manual Nexus download ("UncensorMod 411 4 2026-10-11T21-53Z xyz") keeps just the mod name.
+            from .nexus import parse_nexus_archive_name
+            parsed = parse_nexus_archive_name(source.name) if is_archive else None
+            if not name and parsed is not None:
+                name = parsed[0]
+                version = version or parsed[2]
+                nexus_mod_id = nexus_mod_id or parsed[1]
             mod_name = name or source.stem
             mod_id = self.store.unique_mod_id(mod_name)
             mod_store_dir = self.store.mod_dir(mod_id)

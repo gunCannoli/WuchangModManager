@@ -190,3 +190,45 @@ class TestBaseAndNexus(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUpdateDetection(unittest.TestCase):
+    def test_is_update_available(self) -> None:
+        from wmm.nexus import is_update_available, latest_main_file
+
+        self.assertTrue(is_update_available("1.3.0", 20, "1.2.0", 10))
+        self.assertFalse(is_update_available("1.2.0", 20, "1.2.0", 10))  # same version re-upload
+        self.assertFalse(is_update_available("1.2.0", 10, "1.2.0", 10))
+        self.assertTrue(is_update_available("1.10.0", 0, "1.9.0", None))  # natural compare, no file id
+        self.assertFalse(is_update_available("1.9.0", 0, "1.10.0", None))
+        self.assertFalse(is_update_available("", None, "1.0", None))
+        data = {"files": [{"file_id": 5, "category_name": "OPTIONAL", "version": "9"}, {"file_id": 3, "category_name": "MAIN", "version": "1.1"}, {"file_id": 4, "category_name": "MAIN", "version": "1.2"}]}
+        self.assertEqual(latest_main_file(data)["version"], "1.2")
+
+
+class TestSanitizeUrl(unittest.TestCase):
+    def test_spaces_encoded_and_query_kept(self) -> None:
+        from wmm.nexus import sanitize_url
+
+        u = "https://cf-files.nexusmods.com/cdn/7976/386/Casting Speed x3-386-1-0-1772254188.rar?expires=1795391817&md5=tvdy7yK_bdEZJEQYTdxTHA&user_id=251053482"
+        out = sanitize_url(u)
+        self.assertNotIn(" ", out)
+        self.assertIn("Casting%20Speed%20x3-386-1-0-1772254188.rar?expires=1795391817&md5=tvdy7yK_bdEZJEQYTdxTHA&user_id=251053482", out)
+        self.assertEqual(sanitize_url(out), out)  # idempotent, no double encoding
+
+
+class TestManualDownloadName(unittest.TestCase):
+    def test_parse_archive_name(self) -> None:
+        from wmm.nexus import parse_nexus_archive_name
+
+        self.assertEqual(
+            parse_nexus_archive_name("UncensorMod 411 4 2026-10-11T21-53Z AMLpw5goK.zip"), ("UncensorMod", 411, "4")
+        )
+        self.assertEqual(
+            parse_nexus_archive_name("WMF 500 1.0.0 2026-11-20T05-00Z yPd43amsq.7z"), ("WMF", 500, "1.0.0")
+        )
+        self.assertEqual(
+            parse_nexus_archive_name("Casting Speed x3-386-1-0-1772254188.rar"), ("Casting Speed x3", 386, "1.0")
+        )
+        self.assertIsNone(parse_nexus_archive_name("MyHandmade_P.zip"))
+        self.assertIsNone(parse_nexus_archive_name("Some Mod v2.zip"))

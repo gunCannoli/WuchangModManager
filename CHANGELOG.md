@@ -2,6 +2,19 @@
 
 All notable changes to **Wuchang Mod Manager (WMM)** are documented here.
 
+## v0.6.0-beta (2026-11-22)
+
+- Icon toolbar, mod filter box, sortable column titles; Refresh button.
+- Mod order column; drag and drop or Move / Set order for mods and Paks.
+- Multi-select in the right panel with bulk actions: enable, disable, delete downloads. Space toggles the selected rows.
+- Enable all / Enable selected / Disable selected / Disable all.
+- Double-click a row to open its details.
+- Nexus update badge on the mod version.
+- Paks tab shows the original pak names.
+- Clean mod names for manual Nexus downloads; rename in details.
+- Fixed: checkbox toggling and multi-select; Nexus download URLs with spaces; row selection losing its colours.
+- Faster reorder (native process check).
+
 ## v0.5.0-beta (2026-11-22)
 
 - Settings: the *Show UE4SS core mods* and *Handle nxm:// links* checkboxes now line up on the left with the others.
