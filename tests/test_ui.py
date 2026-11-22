@@ -101,13 +101,12 @@ class TestUI(unittest.TestCase):
             self.assertFalse(ob.row_setup.isEnabled())
             self.assertFalse(ob.btn_finish.isEnabled())
 
+            from wmm.ui.details_dialog import ModDetailsDialog
             from wmm.ui.profiles_dialog import ProfilesDialog
 
             sd = SettingsDialog(win.store, t, game=win.game, package_root=pkg_root)
             self.assertGreaterEqual(sd.combo_lang.count(), 1)
-            self.assertIn("cli launch -- %command%", sd.edit_steam_launch.text())
             self.assertEqual(sd.edit_game.cursorPosition(), 0)
-            self.assertEqual(sd.edit_steam_launch.cursorPosition(), 0)
 
             pd = ProfilesDialog(win.store, t)
             self.assertGreaterEqual(pd.list_profiles.count(), 1)
@@ -119,6 +118,11 @@ class TestUI(unittest.TestCase):
             self.assertTrue(win.store.delete_profile("boss_rush_copy"))
             self.assertNotIn("boss_rush_copy", win.store.list_profiles())
 
+            first_mod = win.store.list_mods()[0]
+            dd = ModDetailsDialog(first_mod, win.store.load_manifest(), win.conflict_report, t)
+            self.assertIn("No asset overrides", dd.overrides_view.toPlainText())
+
+            dd.close()
             pd.close()
             ob.close()
             sd.close()

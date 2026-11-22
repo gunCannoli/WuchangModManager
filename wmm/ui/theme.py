@@ -67,6 +67,13 @@ QTableWidget::item:focus, QTreeWidget::item:focus, QListWidget::item:focus {{
     outline: none;
     border: none;
 }}
+QListWidget::item {{
+    padding: 4px 6px;
+}}
+QListWidget QLineEdit {{
+    padding: 1px 6px;
+    margin: 0px;
+}}
 QHeaderView::section {{
     background-color: #202226;
     color: #AEB3BE;

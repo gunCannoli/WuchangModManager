@@ -21,7 +21,29 @@ from .deploy import Manager
 from .store import ModRecord
 
 NEXUS_API_V1 = "https://api.nexusmods.com/v1"
+NEXUS_WEB_BASE = "https://www.nexusmods.com"
 DEFAULT_GAME_DOMAIN = "wuchangfallenfeathers"
+
+# Matches Nexus manual/manager archive naming:
+#   "WMF-500-1-0-0-1732078800.zip"  or  "WMF 500 1.0.0 2026-11-20T05-00Z yPd43amsq.zip"
+_NEXUS_DASH_ID_RE = re.compile(r"-(?P<id>\d{1,7})-(?:v?\d+(?:[._-]\d+)+|\d{9,})")
+_NEXUS_SPACE_ID_RE = re.compile(r"\s(?P<id>\d{1,7})\s+v?\d+\.\d+")
+
+
+def nexus_mod_url(mod_id: int, domain: str = DEFAULT_GAME_DOMAIN) -> str:
+    return f"{NEXUS_WEB_BASE}/{domain}/mods/{mod_id}"
+
+
+def parse_nexus_mod_id_from_filename(filename: str) -> Optional[int]:
+    """Best-effort extraction of a Nexus mod ID from a downloaded archive filename."""
+    stem = Path(filename).stem
+    for rx in (_NEXUS_DASH_ID_RE, _NEXUS_SPACE_ID_RE):
+        m = rx.search(stem)
+        if m:
+            val = int(m.group("id"))
+            if val > 0 and not (1990 <= val <= 2099):
+                return val
+    return None
 
 
 @dataclass
@@ -115,6 +137,42 @@ class NexusClient:
 
     def get_mod_files(self, mod_id: int, domain: str = DEFAULT_GAME_DOMAIN) -> dict[str, Any]:
         return self._get_json(f"/games/{domain}/mods/{mod_id}/files.json")
+
+    def get_mod_file_info(
+        self,
+        mod_id: int,
+        file_id: int,
+        domain: str = DEFAULT_GAME_DOMAIN,
+    ) -> dict[str, Any]:
+        return self._get_json(f"/games/{domain}/mods/{mod_id}/files/{file_id}.json")
+
+    def endorse_mod(
+        self,
+        mod_id: int,
+        version: str = "",
+        domain: str = DEFAULT_GAME_DOMAIN,
+    ) -> dict[str, Any]:
+        """Endorse a mod on Nexus Mods (POST /v1/games/{domain}/mods/{mod_id}/endorse.json)."""
+        path = f"/games/{domain}/mods/{mod_id}/endorse.json"
+        url = f"{NEXUS_API_V1}{path}"
+        headers = self._headers()
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        body = urllib.parse.urlencode({"version": version or "1.0"}).encode("utf-8")
+        req = urllib.request.Request(url, data=body, headers=headers, method="POST")
+        try:
+            open_fn = self._opener.open if self._opener else urllib.request.urlopen
+            with open_fn(req, timeout=30) as resp:
+                return json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                err_body = json.loads(exc.read().decode("utf-8", errors="ignore"))
+                detail = err_body.get("message") or ""
+            except Exception:
+                pass
+            raise NexusError(detail or f"Nexus HTTP {exc.code} for {path}") from exc
+        except urllib.error.URLError as exc:
+            raise NexusError(f"Nexus network error: {exc.reason}") from exc
 
     def get_download_links(
         self,
@@ -211,6 +269,8 @@ def update_mod_preserving_configs(
     mod_id: str,
     new_source: Path,
     new_version: str = "",
+    backup_configs: bool = False,
+    nexus_mod_id: Optional[int] = None,
 ) -> tuple[ModRecord, dict[str, dict]]:
     """Update an existing mod from new_source while preserving every user config.lua value (§1.9, §6)."""
     old_mod = manager.store.load_mod(mod_id)
@@ -224,13 +284,34 @@ def update_mod_preserving_configs(
         rel = str(cfg.relative_to(old_mod_dir)).replace("\\", "/")
         saved_configs[rel] = cfg.read_text(encoding="utf-8", errors="replace")
 
+    if backup_configs:
+        cfg_files = [
+            p
+            for p in old_mod_dir.rglob("*")
+            if p.is_file()
+            and p.name.lower() in ("config.lua", "config.ini", "config.json", "settings.ini")
+        ]
+        if cfg_files:
+            stamp = time.strftime("%Y%m%d_%H%M%S")
+            bdir = manager.store.backup_dir / f"config_{mod_id}_{stamp}"
+            for cf in cfg_files:
+                rel = cf.relative_to(old_mod_dir)
+                dst = bdir / rel
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(cf, dst)
+
     prof = manager.store.load_profile()
     was_enabled = mod_id in prof.enabled_mods
     if was_enabled:
         manager.set_enabled(mod_id, False)
 
     # Add the new version to a temp mod_id, then swap into old mod_id
-    temp_rec = manager.add_mod(new_source, name=old_mod.name, version=new_version or old_mod.version)
+    temp_rec = manager.add_mod(
+        new_source,
+        name=old_mod.name,
+        version=new_version or old_mod.version,
+        nexus_mod_id=nexus_mod_id or old_mod.nexus_mod_id,
+    )
     temp_dir = manager.store.mod_dir(temp_rec.id)
 
     merge_summaries: dict[str, dict] = {}
@@ -249,7 +330,7 @@ def update_mod_preserving_configs(
     shutil.rmtree(old_mod_dir)
     shutil.move(str(temp_dir), str(old_mod_dir))
     temp_rec.id = mod_id
-    temp_rec.nexus_mod_id = old_mod.nexus_mod_id
+    temp_rec.nexus_mod_id = nexus_mod_id or old_mod.nexus_mod_id or temp_rec.nexus_mod_id
     manager.store.save_mod(temp_rec)
 
     if was_enabled:

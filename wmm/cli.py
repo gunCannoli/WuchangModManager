@@ -305,64 +305,6 @@ def cmd_base_status(args: argparse.Namespace, store: Store, t: Translator) -> in
     return 0
 
 
-def steam_launch_option_string() -> str:
-    """Return the exact string to paste into Steam -> Properties -> Launch Options."""
-    exe = Path(sys.executable)
-    if getattr(sys, "frozen", False):
-        return f'"{exe}" cli launch -- %command%'
-    return f'"{exe}" -m wmm cli launch -- %command%'
-
-
-def create_desktop_shortcut(game: Optional[GameInstall] = None) -> Path:
-    """Create a Desktop shortcut that applies WMM's active profile and launches the game directly."""
-    desktop = Path.home() / "Desktop"
-    desktop.mkdir(parents=True, exist_ok=True)
-    pkg_root = _package_root()
-
-    if sys.platform == "win32":
-        lnk_path = desktop / "Wuchang (WMM).lnk"
-        if getattr(sys, "frozen", False):
-            target = str(Path(sys.executable))
-            args = "cli play"
-        else:
-            py = Path(sys.executable)
-            pyw = py.with_name("pythonw.exe")
-            target = str(pyw if pyw.is_file() else py)
-            args = "-m wmm cli play"
-        icon = str(game.exe_path) if (game is not None and game.exe_path.is_file()) else target
-        ps_script = (
-            "$ws = New-Object -ComObject WScript.Shell; "
-            f"$sc = $ws.CreateShortcut('{str(lnk_path).replace(chr(39), chr(39)*2)}'); "
-            f"$sc.TargetPath = '{target.replace(chr(39), chr(39)*2)}'; "
-            f"$sc.Arguments = '{args}'; "
-            f"$sc.WorkingDirectory = '{str(pkg_root).replace(chr(39), chr(39)*2)}'; "
-            f"$sc.IconLocation = '{icon.replace(chr(39), chr(39)*2)},0'; "
-            "$sc.Description = 'Launch Wuchang: Fallen Feathers with WMM'; "
-            "$sc.Save()"
-        )
-        subprocess.run(
-            ["powershell", "-NoProfile", "-Command", ps_script],
-            check=True,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        return lnk_path
-
-    desktop_file = desktop / "wuchang-wmm.desktop"
-    exe = Path(sys.executable)
-    exec_cmd = f'"{exe}" cli play' if getattr(sys, "frozen", False) else f'"{exe}" -m wmm cli play'
-    desktop_file.write_text(
-        "[Desktop Entry]\n"
-        "Type=Application\n"
-        "Name=Wuchang (WMM)\n"
-        f"Path={pkg_root}\n"
-        f"Exec={exec_cmd}\n"
-        "Terminal=false\n",
-        encoding="utf-8",
-        newline="\n",
-    )
-    return desktop_file
-
-
 def cmd_play(args: argparse.Namespace, store: Store, t: Translator) -> int:
     """Apply active WMM profile and launch the game directly via its detected launcher."""
     from .platform import get_platform
@@ -435,28 +377,6 @@ def cmd_nxm(args: argparse.Namespace, store: Store, t: Translator) -> int:
     return launch_gui(data_dir=store.data_dir, initial_nxm_uri=uri)
 
 
-def cmd_launch(args: argparse.Namespace, store: Store, t: Translator) -> int:
-    """Steam Launch Options wrapper: apply active WMM profile, then run the game command."""
-    game = _resolve_game(store, args.game)
-    if game is not None:
-        mgr = Manager(store, game, tools_dir=_package_root() / "tools")
-        try:
-            mgr.apply_profile()
-        except DeployError as exc:
-            print(f"[WMM] launch pre-apply skipped: {exc}", file=sys.stderr)
-
-    cmd = list(args.cmd or [])
-    if cmd and cmd[0] == "--":
-        cmd = cmd[1:]
-    if not cmd:
-        if game is None:
-            print(t.tr("cli.game_not_found"), file=sys.stderr)
-            return 1
-        cmd = [str(game.exe_path)]
-    res = subprocess.run(cmd)
-    return int(res.returncode)
-
-
 def cmd_lang_template(args: argparse.Namespace, store: Store, t: Translator) -> int:
     root = _package_root()
     en_path, added = update_en_template(root / "wmm", root / "lang")
@@ -512,8 +432,6 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("play", help="Apply active profile and launch the game directly")
     sp_nxm = sub.add_parser("nxm", help="Handle an nxm:// Mod Manager Download URI")
     sp_nxm.add_argument("uri", help="nxm:// URI")
-    sp_launch = sub.add_parser("launch", help="Apply active profile then exec game command (for Steam Launch Options)")
-    sp_launch.add_argument("cmd", nargs=argparse.REMAINDER, help="Command passed by Steam (after --)")
 
     return p
 
@@ -553,7 +471,6 @@ def main(argv: Optional[list[str]] = None) -> int:
         "remove-all": cmd_remove_all,
         "play": cmd_play,
         "nxm": cmd_nxm,
-        "launch": cmd_launch,
         "lang-template": cmd_lang_template,
     }
     return dispatch[args.command](args, store, t)

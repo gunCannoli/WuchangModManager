@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QSize, Qt
 from PySide6.QtWidgets import (
     QDialog,
     QHBoxLayout,
@@ -97,6 +97,7 @@ class ProfilesDialog(QDialog):
         for idx, pname in enumerate(profiles):
             item = QListWidgetItem(pname)
             item.setData(Qt.ItemDataRole.UserRole, pname)
+            item.setSizeHint(QSize(0, 28))
             self.list_profiles.addItem(item)
             if pname == target:
                 selected_row = idx
@@ -124,6 +125,7 @@ class ProfilesDialog(QDialog):
             self._remove_pending_row()
         self._pending_clone_src = clone_src
         item = QListWidgetItem(initial_text)
+        item.setSizeHint(QSize(0, 28))
         item.setFlags(
             Qt.ItemFlag.ItemIsSelectable
             | Qt.ItemFlag.ItemIsEnabled

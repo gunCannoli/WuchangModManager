@@ -69,7 +69,7 @@ class OnboardingDialog(QDialog):
 
         settings = self.store.load_settings()
         saved_mods_dir = settings.get("mods_archive_dir", "")
-        self.mods_archive_dir = Path(saved_mods_dir) if saved_mods_dir else (self.package_root / "mods")
+        self.mods_archive_dir = Path(saved_mods_dir) if saved_mods_dir else (self.package_root / "downloads")
         self._skip_applied = settings.get("modding_mode") == "skip"
         self._last_feedback = ""
 
@@ -411,6 +411,9 @@ class OnboardingDialog(QDialog):
 
                 if st_after.ue4ss.installed and st_after.bp_loader.kind != "wmm_lua":
                     install_wmm_lua_bploader(self.game, self.store)
+                # Re-sync active profile so mods.txt keeps any already-enabled WMM mods
+                from ..deploy import Manager
+                Manager(self.store, self.game, tools_dir=self.package_root / "tools").apply_profile()
                 self._skip_applied = False
             elif mode == "paks_only":
                 st_cur = detect_mod_base(self.game)

@@ -6,17 +6,20 @@ import os
 import shutil
 import subprocess
 import sys
+import webbrowser
 from pathlib import Path
 from typing import Optional
 
-from PySide6.QtCore import Qt, QThread, Signal
+from PySide6.QtCore import Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QDragEnterEvent, QDropEvent, QFont
 from PySide6.QtNetwork import QLocalServer
 from PySide6.QtWidgets import (
     QAbstractItemView,
+    QCheckBox,
     QComboBox,
     QDialog,
     QFileDialog,
+    QHBoxLayout,
     QHeaderView,
     QInputDialog,
     QLabel,
@@ -42,11 +45,19 @@ from ..deploy import DeployError, Manager, UnmanagedMod, scan_unmanaged_mods
 from ..extract import ExtractError
 from ..game import GameInstall, detect_all_installs, running_game_processes, validate_game_root
 from ..i18n import Translator
-from ..nexus import NexusClient, NexusError, parse_nxm_uri, update_mod_preserving_configs
+from ..nexus import (
+    NexusClient,
+    NexusError,
+    nexus_mod_url,
+    parse_nexus_mod_id_from_filename,
+    parse_nxm_uri,
+    update_mod_preserving_configs,
+)
 from ..paks import PakConflictReport, parse_pak_priority, scan_folder_conflicts
 from ..platform import get_platform
 from ..store import ModRecord, Profile, Store
 from ..ue4ss import BASE_UE4SS_MODS, LAST_UE4SS_MOD, parse_mods_txt, write_mods_txt
+from .details_dialog import ModDetailsDialog
 from .onboarding import OnboardingDialog
 from .profiles_dialog import ProfilesDialog
 from .settings_dialog import SettingsDialog
@@ -73,7 +84,7 @@ class _DownloadWorker(QThread):
     """Background worker for Nexus nxm:// and https:// downloads with live progress + speed."""
 
     progress = Signal(int, str, int, str)  # dl_id, filename, percent (-1 if unknown), speed_str
-    finished_ok = Signal(int, str, object, str)  # dl_id, downloaded_path, mod_name_or_None, mod_version
+    finished_ok = Signal(int, str, object, str, object)  # dl_id, path, mod_name_or_None, version, nexus_mod_id_or_None
     failed = Signal(int, str)
 
     def __init__(self, dl_id: int, uri: str, api_key: str, dl_dir: Path, parent: Optional[QWidget] = None):
@@ -99,34 +110,96 @@ class _DownloadWorker(QThread):
                     raise NexusError("No download URL returned by Nexus")
                 mod_name: Optional[str] = None
                 mod_ver = ""
+                file_name: Optional[str] = None
                 try:
                     info = client.get_mod_info(link.mod_id, domain=link.domain)
                     mod_name = info.get("name") or None
                     mod_ver = str(info.get("version") or "")
                 except Exception:
                     pass
-                dl_path = client.download_url(links[0]["URI"], self.dl_dir, progress_cb=_on_prog)
-                self.finished_ok.emit(self.dl_id, str(dl_path), mod_name, mod_ver)
+                try:
+                    finfo = client.get_mod_file_info(link.mod_id, link.file_id, domain=link.domain)
+                    file_name = finfo.get("file_name") or None
+                    if not mod_ver and finfo.get("version"):
+                        mod_ver = str(finfo.get("version"))
+                except Exception:
+                    pass
+                dl_path = client.download_url(
+                    links[0]["URI"], self.dl_dir, filename=file_name, progress_cb=_on_prog
+                )
+                self.finished_ok.emit(self.dl_id, str(dl_path), mod_name, mod_ver, link.mod_id)
             else:
                 client = NexusClient(self.api_key or "public")
                 dl_path = client.download_url(self.uri, self.dl_dir, progress_cb=_on_prog)
-                self.finished_ok.emit(self.dl_id, str(dl_path), None, "")
+                self.finished_ok.emit(self.dl_id, str(dl_path), None, "", parse_nexus_mod_id_from_filename(dl_path.name))
         except Exception as exc:
             self.failed.emit(self.dl_id, str(exc))
 
 
 class _ResponsiveTable(QTableWidget):
-    """Table where all data columns are user-resizable and flex_col fills remaining width."""
+    """Table where all data columns are user-resizable with zero dead space.
+
+    Resize rules:
+    - Shrinking any column expands the biggest other resizable column to fill the space.
+    - Shrinking the biggest column expands the second-biggest resizable column.
+    - On ties, the State/Status column (last column) is expanded.
+    """
 
     def __init__(self, rows: int, cols: int, flex_col: int = 1, parent: Optional[QWidget] = None):
         super().__init__(rows, cols, parent)
         self.flex_col = flex_col
+        self.status_col = cols - 1
         self._adjusting = False
         self.horizontalHeader().sectionResized.connect(self._on_col_resized)
 
+    def _interactive_cols(self) -> list[int]:
+        hdr = self.horizontalHeader()
+        return [
+            c
+            for c in range(self.columnCount())
+            if hdr.sectionResizeMode(c) != QHeaderView.ResizeMode.Fixed
+        ]
+
+    def _min_col_width(self, col: int) -> int:
+        return 44 if col != self.flex_col else 80
+
+    def _pick_absorber(self, exclude_col: Optional[int] = None) -> Optional[int]:
+        cands = [c for c in self._interactive_cols() if c != exclude_col]
+        if not cands:
+            return None
+        max_w = max(self.columnWidth(c) for c in cands)
+        tied = [c for c in cands if self.columnWidth(c) == max_w]
+        if len(tied) > 1 and self.status_col in tied:
+            return self.status_col
+        if self.flex_col in tied:
+            return self.flex_col
+        return tied[0]
+
     def _on_col_resized(self, logical_index: int, _old: int, _new: int) -> None:
-        if logical_index != self.flex_col:
-            self.fit_flex_column()
+        if self._adjusting:
+            return
+        avail = self.viewport().width()
+        if avail <= 0:
+            return
+        total = sum(self.columnWidth(c) for c in range(self.columnCount()))
+        gap = avail - total
+        if gap == 0:
+            return
+        absorber = self._pick_absorber(exclude_col=logical_index)
+        if absorber is None:
+            return
+        self._adjusting = True
+        try:
+            cur_w = self.columnWidth(absorber)
+            min_w = self._min_col_width(absorber)
+            if gap > 0:
+                self.setColumnWidth(absorber, cur_w + gap)
+            else:
+                shrink = min(-gap, max(0, cur_w - min_w))
+                if shrink > 0:
+                    self.setColumnWidth(absorber, cur_w - shrink)
+        finally:
+            self._adjusting = False
 
     def fit_flex_column(self) -> None:
         if self._adjusting:
@@ -134,18 +207,43 @@ class _ResponsiveTable(QTableWidget):
         avail = self.viewport().width()
         if avail <= 0:
             return
+        total = sum(self.columnWidth(c) for c in range(self.columnCount()))
+        gap = avail - total
+        if gap == 0:
+            return
         self._adjusting = True
         try:
-            other = sum(self.columnWidth(c) for c in range(self.columnCount()) if c != self.flex_col)
-            target = max(120, avail - other)
-            if self.columnWidth(self.flex_col) != target:
-                self.setColumnWidth(self.flex_col, target)
+            if gap > 0:
+                absorber = self._pick_absorber(exclude_col=None)
+                if absorber is not None:
+                    self.setColumnWidth(absorber, self.columnWidth(absorber) + gap)
+            else:
+                rem = -gap
+                # Shrink from largest interactive column down to min width so columns stay flush
+                ordered = sorted(
+                    self._interactive_cols(),
+                    key=lambda c: (self.columnWidth(c), 1 if c == self.status_col else 0),
+                    reverse=True,
+                )
+                for col in ordered:
+                    if rem <= 0:
+                        break
+                    cur_w = self.columnWidth(col)
+                    min_w = self._min_col_width(col)
+                    take = min(rem, max(0, cur_w - min_w))
+                    if take > 0:
+                        self.setColumnWidth(col, cur_w - take)
+                        rem -= take
         finally:
             self._adjusting = False
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
         self.fit_flex_column()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        QTimer.singleShot(0, self.fit_flex_column)
 
 
 class LogDialog(QDialog):
@@ -158,6 +256,49 @@ class LogDialog(QDialog):
         self.view.setReadOnly(True)
         self.view.setPlainText("\n".join(log_lines))
         lay.addWidget(self.view)
+
+
+class _GameLockDialog(QDialog):
+    """Centered WindowModal overlay locking WMM UI while the game is running (background downloads keep running)."""
+
+    def __init__(self, translator: Translator, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle(translator.tr("app.title"))
+        self.setWindowModality(Qt.WindowModality.WindowModal)
+        self.setWindowFlags(
+            Qt.WindowType.Dialog
+            | Qt.WindowType.CustomizeWindowHint
+            | Qt.WindowType.WindowTitleHint
+        )
+        self.setFixedWidth(400)
+        lay = QVBoxLayout(self)
+        lay.setSpacing(12)
+        lay.setContentsMargins(20, 20, 20, 18)
+
+        lbl_title = QLabel(f"<b>{translator.tr('lock.title')}</b>")
+        lbl_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_title.setWordWrap(True)
+        lay.addWidget(lbl_title)
+
+        lbl_body = QLabel(translator.tr("lock.body"))
+        lbl_body.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        lbl_body.setWordWrap(True)
+        lbl_body.setStyleSheet("color: #AEB3BE;")
+        lay.addWidget(lbl_body)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        self.btn_unlock = QPushButton(translator.tr("btn.unlock"))
+        self.btn_unlock.setFixedWidth(100)
+        self.btn_unlock.setProperty("accent", True)
+        self.btn_unlock.clicked.connect(self.accept)
+        btn_row.addWidget(self.btn_unlock)
+        btn_row.addStretch(1)
+        lay.addLayout(btn_row)
+
+    def reject(self) -> None:
+        # Ignore Escape while locked; user must close the game or click Unlock
+        pass
 
 
 class MainWindow(QMainWindow):
@@ -187,6 +328,8 @@ class MainWindow(QMainWindow):
         self._dl_seq = 0
         self._suppress_table_signals = False
         self._suppress_right_signals = False
+        self._game_unlocked = False
+        self._lock_dialog: Optional[_GameLockDialog] = None
 
         self.setWindowTitle(self.t.tr("app.title"))
         self.resize(980, 620)
@@ -200,7 +343,15 @@ class MainWindow(QMainWindow):
         if run_onboarding_if_needed and (self.game is None or not settings.get("onboarded", False)):
             self._open_onboarding()
 
+        if self.game is not None:
+            self._log(f"Game: {self.game.root} ({self.game.launcher}, build {self.game.build_id})")
         self.refresh_all()
+
+        self._game_poll_timer = QTimer(self)
+        self._game_poll_timer.setInterval(2000)
+        self._game_poll_timer.timeout.connect(self._poll_game_running)
+        self._game_poll_timer.start()
+        self._poll_game_running()
 
     def _start_nxm_ipc_server(self) -> None:
         self._ipc_server = QLocalServer(self)
@@ -224,9 +375,47 @@ class MainWindow(QMainWindow):
             sock.disconnectFromServer()
 
     def closeEvent(self, event) -> None:
+        if hasattr(self, "_game_poll_timer"):
+            self._game_poll_timer.stop()
+        if self._lock_dialog is not None:
+            self._lock_dialog.hide()
+            self._lock_dialog.deleteLater()
+            self._lock_dialog = None
         if hasattr(self, "_ipc_server") and self._ipc_server.isListening():
             self._ipc_server.close()
         super().closeEvent(event)
+
+    def _poll_game_running(self) -> None:
+        running = bool(running_game_processes(self.plat))
+        if running and not self._game_unlocked:
+            if self._lock_dialog is None:
+                dlg = _GameLockDialog(self.t, parent=self)
+                dlg.accepted.connect(self._on_manual_unlock)
+                self._lock_dialog = dlg
+                dlg.show()
+        elif not running:
+            self._game_unlocked = False
+            if self._lock_dialog is not None:
+                dlg = self._lock_dialog
+                self._lock_dialog = None
+                dlg.hide()
+                dlg.deleteLater()
+
+    def _on_manual_unlock(self) -> None:
+        self._game_unlocked = True
+        if self._lock_dialog is not None:
+            dlg = self._lock_dialog
+            self._lock_dialog = None
+            dlg.deleteLater()
+        self._log("WMM manually unlocked while game is running.")
+
+    def _notify_restart_if_game_running(self) -> None:
+        if running_game_processes(self.plat):
+            QMessageBox.information(
+                self,
+                self.t.tr("app.title"),
+                self.t.tr("lock.restart_required"),
+            )
 
     def _log(self, msg: str) -> None:
         self.logs.append(msg)
@@ -245,7 +434,13 @@ class MainWindow(QMainWindow):
     def _manager(self) -> Optional[Manager]:
         if self.game is None:
             return None
-        return Manager(self.store, self.game, platform=self.plat, tools_dir=self.package_root / "tools")
+        return Manager(
+            self.store,
+            self.game,
+            platform=self.plat,
+            tools_dir=self.package_root / "tools",
+            allow_while_running=self._game_unlocked,
+        )
 
     # --- UI construction ---
 
@@ -334,10 +529,10 @@ class MainWindow(QMainWindow):
         self.tab_ue4ss.customContextMenuRequested.connect(self._on_ue4ss_context_menu)
         self.right_tabs.addTab(self.tab_ue4ss, self.t.tr("tab.ue4ss"))
 
-        # Tab 2: Paks ([On, Order, Name, Overrides])
+        # Tab 2: Paks ([On, Order, Name, State])
         self.tab_paks = _ResponsiveTable(0, 4, flex_col=2)
         self.tab_paks.setHorizontalHeaderLabels(
-            ["", self.t.tr("tabcol.load_order"), self.t.tr("col.name"), self.t.tr("tabcol.overrides")]
+            ["", self.t.tr("tabcol.load_order"), self.t.tr("col.name"), self.t.tr("tabcol.state")]
         )
         self._style_right_table(
             self.tab_paks, col_widths={0: (30, True), 1: (46, False), 2: (180, False), 3: (95, False)}
@@ -546,24 +741,27 @@ class MainWindow(QMainWindow):
         bi_font = _bold_italic_font(self.tab_ue4ss.font())
         keybinds_tip = "Core UE4SS hotkey engine required by Lua mods (cannot be disabled)."
 
+        show_core = bool(self.store.load_settings().get("show_ue4ss_core", False))
+
         # Row tuple: (mode, checked, payload, label, state, text_color, state_color, bold_italic, tooltip, folder_path)
-        # mode: "kit" (no checkbox), "locked_core" (disabled hard-checked checkbox), "mod" (interactive checkbox)
+        # mode: "locked_core" (disabled hard-checked checkbox), "mod" (interactive checkbox)
         rows: list[tuple[str, bool, object, str, str, str, str, bool, str, Optional[Path]]] = []
         if self.game is not None:
             st = detect_mod_base(self.game)
-            if st.ue4ss.installed:
-                ver = st.ue4ss.version_line or "installed"
-                rows.append(("kit", True, None, f"[Modding Kit] UE4SS ({ver})", "Active", "#E2E4E9", "#4CAF7D", False, "", self.game.ue4ss_dir))
-            if st.enabler.present:
-                rows.append(("kit", True, None, f"[Modding Kit] Pak Enabler ({st.enabler.kind})", "Active", "#E2E4E9", "#4CAF7D", False, "", self.game.binaries_dir))
-            if st.bp_loader.kind != "none":
-                bp_lbl = "WMM Lua BP Loader" if st.bp_loader.kind == "wmm_lua" else "WFF_BPLoader"
-                bp_dir = (self.game.ue4ss_mods_dir / "WMM_BPLoader") if st.bp_loader.kind == "wmm_lua" else self.game.mods_pak_dir
-                rows.append(("kit", True, None, f"[Modding Kit] {bp_lbl}", "Active", "#E2E4E9", "#4CAF7D", False, "", bp_dir))
+            if show_core:
+                if st.ue4ss.installed:
+                    ver = st.ue4ss.version_line or "installed"
+                    rows.append(("locked_core", True, None, f"UE4SS ({ver})", "Core", "#7A808C", "#7A808C", True, "Core UE4SS scripting engine.", self.game.ue4ss_dir))
+                if st.enabler.present:
+                    rows.append(("locked_core", True, None, f"Pak Enabler ({st.enabler.kind})", "Core", "#7A808C", "#7A808C", True, "Core unsigned pak loader.", self.game.binaries_dir))
+                if st.bp_loader.kind != "none":
+                    bp_lbl = "WMM Lua BP Loader" if st.bp_loader.kind == "wmm_lua" else "WFF_BPLoader"
+                    bp_dir = (self.game.ue4ss_mods_dir / "WMM_BPLoader") if st.bp_loader.kind == "wmm_lua" else self.game.mods_pak_dir
+                    rows.append(("locked_core", True, None, bp_lbl, "Core", "#7A808C", "#7A808C", True, "Core Blueprint mod loader.", bp_dir))
 
-            # Keybinds is always the first mod row: greyed-out hard-checked, bold italic, state 'Core'
-            if st.ue4ss.installed or self.game.ue4ss_mods_txt.is_file():
-                rows.append(("locked_core", True, None, LAST_UE4SS_MOD, "Core", "#7A808C", "#7A808C", True, keybinds_tip, self.game.ue4ss_mods_dir))
+                # Keybinds: greyed-out hard-checked, bold italic, state 'Core'
+                if st.ue4ss.installed or self.game.ue4ss_mods_txt.is_file():
+                    rows.append(("locked_core", True, None, LAST_UE4SS_MOD, "Core", "#7A808C", "#7A808C", True, keybinds_tip, self.game.ue4ss_mods_dir))
 
             txt_entries = parse_mods_txt(self.game.ue4ss_mods_txt)
             seen: set[str] = {LAST_UE4SS_MOD.lower()}
@@ -594,6 +792,8 @@ class MainWindow(QMainWindow):
                 seen.add(low)
                 mod_path = self.game.ue4ss_mods_dir / name
                 if low in _CORE_UE4SS_LOWER:
+                    if not show_core:
+                        continue
                     tip = "Built-in UE4SS core component."
                     rows.append(("mod", en, ("unmanaged", name), name, "Core" if en else "Disabled", "#7A808C", "#7A808C", True, tip, mod_path if mod_path.is_dir() else self.game.ue4ss_mods_dir))
                 else:
@@ -667,11 +867,12 @@ class MainWindow(QMainWindow):
         if not payload:
             return
         procs = running_game_processes(self.plat)
-        if procs:
+        if procs and not self._game_unlocked:
             QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("err.game_running", procs=", ".join(procs)))
             self.refresh_all()
             return
         want_on = item.checkState() == Qt.CheckState.Checked
+        ok = False
 
         if payload[0] == "managed":
             _, mod_id, orig_name = payload
@@ -685,14 +886,29 @@ class MainWindow(QMainWindow):
                 try:
                     # Re-applying profile removes the junction when unchecked and recreates it when checked
                     mgr.apply_profile()
+                    ok = True
                     self._log(f"[UE4SS] {orig_name}: {'linked & enabled' if want_on else 'unlinked & disabled'}")
                 except DeployError as exc:
                     QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
         else:
             _, mod_name = payload
+            if want_on and str(mod_name).lower() == "splitscreenmod":
+                ans = QMessageBox.warning(
+                    self,
+                    self.t.tr("app.title"),
+                    self.t.tr("warn.splitscreen_fps"),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.No,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    self.refresh_all()
+                    return
             write_mods_txt(self.game.ue4ss_mods_txt, [(str(mod_name), want_on)], preserve_unmanaged=True)
+            ok = True
             self._log(f"[UE4SS] {mod_name} : {1 if want_on else 0}")
         self.refresh_all()
+        if ok and want_on:
+            self._notify_restart_if_game_running()
 
     def _find_mod_config_file(self, folder: Path) -> Optional[Path]:
         if not folder.is_dir():
@@ -703,51 +919,131 @@ class MainWindow(QMainWindow):
                 return cand
         return None
 
+    def _resolve_nexus_mod_id(self, mod: Optional[ModRecord]) -> Optional[int]:
+        if mod is None:
+            return None
+        if mod.nexus_mod_id:
+            return mod.nexus_mod_id
+        if mod.source:
+            return parse_nexus_mod_id_from_filename(Path(mod.source).name)
+        return None
+
+    def _visit_nexus_page(self, nexus_id: int) -> None:
+        webbrowser.open(nexus_mod_url(nexus_id))
+
+    def _endorse_nexus_mod(self, nexus_id: int, mod_name: str, mod_ver: str = "") -> None:
+        settings = self.store.load_settings()
+        raw_key = settings.get("nexus_api_key", "")
+        api_key = self.plat.unprotect_secret(raw_key) if raw_key else ""
+        if not api_key:
+            QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("endorse.need_api_key"))
+            return
+        try:
+            client = NexusClient(api_key)
+            client.endorse_mod(nexus_id, version=mod_ver)
+            self._log(f"Endorsed {mod_name} (Nexus #{nexus_id})")
+            QMessageBox.information(
+                self,
+                self.t.tr("app.title"),
+                self.t.tr("endorse.ok", name=mod_name, id=nexus_id),
+            )
+        except NexusError as exc:
+            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+
+    def _append_nexus_menu_actions(
+        self,
+        menu: QMenu,
+        nexus_id: Optional[int],
+        mod_name: str,
+        mod_ver: str = "",
+    ) -> None:
+        if nexus_id is None:
+            return
+        menu.addSeparator()
+        act_visit = QAction(self.t.tr("ctx.visit_nexus"), self)
+        act_visit.triggered.connect(lambda: self._visit_nexus_page(nexus_id))
+        menu.addAction(act_visit)
+
+        act_endorse = QAction(self.t.tr("ctx.endorse_nexus"), self)
+        act_endorse.triggered.connect(lambda: self._endorse_nexus_mod(nexus_id, mod_name, mod_ver))
+        menu.addAction(act_endorse)
+
     def _on_ue4ss_context_menu(self, pos) -> None:
-        row = self.tab_ue4ss.currentRow()
+        row = self.tab_ue4ss.rowAt(pos.y())
+        if row < 0:
+            row = self.tab_ue4ss.currentRow()
         if row < 0:
             return
+        chk_item = self.tab_ue4ss.item(row, 0)
         item = self.tab_ue4ss.item(row, 1)
         if not item:
             return
-        raw_path = item.data(Qt.ItemDataRole.UserRole)
-        if not raw_path:
-            return
-        folder = Path(raw_path)
-        if not folder.exists():
-            return
+        raw_path = str(item.data(Qt.ItemDataRole.UserRole) or "").strip()
+        folder = Path(raw_path) if raw_path else None
+        if folder is not None and (not folder.is_absolute() or not folder.exists()):
+            folder = self.game.ue4ss_mods_dir if (self.game is not None and self.game.ue4ss_mods_dir.is_dir()) else None
+        payload = chk_item.data(Qt.ItemDataRole.UserRole) if chk_item else None
+        managed_mod_id = payload[1] if isinstance(payload, tuple) and len(payload) >= 2 and payload[0] == "managed" else None
+
         menu = QMenu(self)
-        act_open = QAction(self.t.tr("ctx.open_folder"), self)
-        act_open.triggered.connect(lambda: self._open_path(folder))
-        menu.addAction(act_open)
+        if managed_mod_id:
+            act_det = QAction(self.t.tr("ctx.details"), self)
+            act_det.triggered.connect(lambda: self._show_mod_details(managed_mod_id))
+            menu.addAction(act_det)
 
-        cfg = self._find_mod_config_file(folder)
-        if cfg is not None:
-            act_cfg = QAction(self.t.tr("ctx.open_config"), self)
-            act_cfg.triggered.connect(lambda: self._open_path(cfg))
-            menu.addAction(act_cfg)
+        if folder is not None and folder.exists():
+            act_open = QAction(self.t.tr("ctx.open_folder"), self)
+            act_open.triggered.connect(lambda: self._open_path(folder))
+            menu.addAction(act_open)
 
-        menu.exec(self.tab_ue4ss.viewport().mapToGlobal(pos))
+            cfg = self._find_mod_config_file(folder)
+            if cfg is not None:
+                act_cfg = QAction(self.t.tr("ctx.open_config"), self)
+                act_cfg.triggered.connect(lambda: self._open_path(cfg))
+                menu.addAction(act_cfg)
+
+        if managed_mod_id:
+            mod = self.store.load_mod(managed_mod_id)
+            nid = self._resolve_nexus_mod_id(mod)
+            if mod is not None and nid is not None:
+                self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
+
+        if menu.actions():
+            menu.exec(self.tab_ue4ss.viewport().mapToGlobal(pos))
 
     def _on_paks_context_menu(self, pos) -> None:
         row = self.tab_paks.currentRow()
         if row < 0:
             return
+        chk_item = self.tab_paks.item(row, 0)
         item = self.tab_paks.item(row, 2)
         if not item:
             return
         raw_path = item.data(Qt.ItemDataRole.UserRole)
-        if not raw_path:
-            return
-        target = Path(raw_path)
-        folder = target.parent if target.is_file() else target
-        if not folder.exists():
-            return
+        target = Path(raw_path) if raw_path else None
+        folder = (target.parent if target.is_file() else target) if target is not None else None
+        owner = chk_item.data(Qt.ItemDataRole.UserRole) if chk_item else None
+        managed_mod_id = owner[0] if isinstance(owner, tuple) and len(owner) >= 2 else None
+
         menu = QMenu(self)
-        act_open = QAction(self.t.tr("ctx.open_folder"), self)
-        act_open.triggered.connect(lambda: self._open_path(folder))
-        menu.addAction(act_open)
-        menu.exec(self.tab_paks.viewport().mapToGlobal(pos))
+        if managed_mod_id:
+            act_det = QAction(self.t.tr("ctx.details"), self)
+            act_det.triggered.connect(lambda: self._show_mod_details(managed_mod_id))
+            menu.addAction(act_det)
+
+        if folder is not None and folder.exists():
+            act_open = QAction(self.t.tr("ctx.open_folder"), self)
+            act_open.triggered.connect(lambda: self._open_path(folder))
+            menu.addAction(act_open)
+
+        if managed_mod_id:
+            mod = self.store.load_mod(managed_mod_id)
+            nid = self._resolve_nexus_mod_id(mod)
+            if mod is not None and nid is not None:
+                self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
+
+        if menu.actions():
+            menu.exec(self.tab_paks.viewport().mapToGlobal(pos))
 
     def _refresh_paks_tab(self, mods: list[ModRecord], manifest) -> None:
         unmanaged_tip = self.t.tr("status.unmanaged_tooltip")
@@ -787,6 +1083,12 @@ class MainWindow(QMainWindow):
         rule = self.store.get_pak_order_rule(self.game.build_id) if self.game else None
         entries.sort(key=lambda item: parse_pak_priority(item[0], item[1], rule).sort_key)
 
+        config_conflict_paks: set[str] = set()
+        if self.conflict_report:
+            for cpak, _cfgs in self.conflict_report.config_conflicts:
+                config_conflict_paks.add(cpak.lower())
+        mod_by_id = {m.id: m for m in mods}
+
         self.tab_paks.setRowCount(len(entries))
         for r, (pname, folder_lbl, checked, owner, is_unmanaged) in enumerate(entries):
             chk = QTableWidgetItem()
@@ -809,36 +1111,43 @@ class MainWindow(QMainWindow):
             elif owner is not None:
                 it_name.setData(Qt.ItemDataRole.UserRole, str(self.store.mod_dir(owner[0])))
 
-            if is_unmanaged:
-                ov_txt = self.t.tr("status.unmanaged")
+            has_cfg_conflict = pname.lower() in config_conflict_paks
+            if not has_cfg_conflict and owner is not None:
+                om = mod_by_id.get(owner[0])
+                if om is not None:
+                    has_cfg_conflict = any(
+                        c.kind == "pak" and c.name == owner[1] and bool(c.config_overrides) for c in om.components
+                    )
+
+            if has_cfg_conflict and checked:
+                st_txt = f"● {self.t.tr('status.conflict')}"
+                color = "#E05252"
+            elif is_unmanaged:
+                st_txt = f"● {self.t.tr('status.unmanaged')}"
                 color = "#7EA8D9"
             elif not checked:
-                ov_txt = "Disabled"
+                st_txt = "Disabled"
                 color = "#7A808C"
+            elif self.conflict_report and pname in self.conflict_report.per_pak and self.conflict_report.per_pak[pname]["assets_lost"] > 0:
+                st_txt = f"● {self.t.tr('status.overridden')}"
+                color = "#E5A93C"
             else:
-                ov_txt = "OK"
+                st_txt = f"● {self.t.tr('status.ok')}"
                 color = "#4CAF7D"
-                if self.conflict_report and pname in self.conflict_report.per_pak:
-                    info = self.conflict_report.per_pak[pname]
-                    if info["assets_lost"] > 0:
-                        ov_txt = f"wins {info['assets_won']} / loses {info['assets_lost']}"
-                        color = "#E5A93C"
-                    elif info["assets_won"] > 0:
-                        ov_txt = f"wins {info['assets_won']}"
-                        color = "#7EA8D9"
 
-            it_ov = QTableWidgetItem(ov_txt)
-            it_ov.setForeground(QColor(color))
+            it_st = QTableWidgetItem(st_txt)
+            it_st.setForeground(QColor(color))
+            it_st.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             if is_unmanaged:
                 it_name.setFont(bi_font)
-                it_ov.setFont(bi_font)
-                for it in (chk, it_rank, it_name, it_ov):
+                it_st.setFont(bi_font)
+                for it in (chk, it_rank, it_name, it_st):
                     it.setToolTip(unmanaged_tip)
 
             self.tab_paks.setItem(r, 0, chk)
             self.tab_paks.setItem(r, 1, it_rank)
             self.tab_paks.setItem(r, 2, it_name)
-            self.tab_paks.setItem(r, 3, it_ov)
+            self.tab_paks.setItem(r, 3, it_st)
 
     def _on_pak_item_changed(self, item: QTableWidgetItem) -> None:
         if self._suppress_right_signals or item.column() != 0:
@@ -856,17 +1165,21 @@ class MainWindow(QMainWindow):
             if c.kind == "pak" and c.name == orig_name:
                 c.selected = want_on
         self.store.save_mod(mod)
+        ok = False
         try:
             mgr.apply_profile()
+            ok = True
             self._log(f"[Pak] {orig_name}: {'enabled' if want_on else 'disabled'}")
         except DeployError as exc:
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
         self.refresh_all()
+        if ok and want_on:
+            self._notify_restart_if_game_running()
 
     def _refresh_downloads_tab(self, mods: list[ModRecord]) -> None:
         settings = self.store.load_settings()
         mods_dir_raw = settings.get("mods_archive_dir", "")
-        dl_dir = Path(mods_dir_raw) if mods_dir_raw else (self.package_root / "mods")
+        dl_dir = Path(mods_dir_raw) if mods_dir_raw else (self.package_root / "downloads")
 
         installed_sources = {Path(m.source).name.lower() for m in mods if m.source}
         archives: list[Path] = []
@@ -940,6 +1253,9 @@ class MainWindow(QMainWindow):
         act_del.triggered.connect(lambda: self._delete_download(p))
         menu.addAction(act_inst)
         menu.addAction(act_open)
+        dl_nid = parse_nexus_mod_id_from_filename(p.name)
+        if dl_nid is not None:
+            self._append_nexus_menu_actions(menu, dl_nid, p.stem)
         menu.addSeparator()
         menu.addAction(act_del)
         menu.exec(self.tab_downloads.viewport().mapToGlobal(pos))
@@ -981,7 +1297,6 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(
             self.t.tr(
                 "statusbar.summary",
-                launcher=self.game.launcher,
                 build_id=self.game.build_id,
                 profile=profile_name,
                 enabled=enabled_count,
@@ -1018,30 +1333,15 @@ class MainWindow(QMainWindow):
         if mod is None:
             return
         manifest = [e for e in self.store.load_manifest() if e.mod_id == mod_id]
-        lines = [
-            f"ID: {mod.id}",
-            f"Version: {mod.version or '-'}",
-            f"Source: {mod.source}",
-            "",
-            "Components:",
-        ]
-        for c in mod.components:
-            sel = "" if c.selected else " (unselected variant)"
-            lines.append(f"  - [{c.kind}] {c.name} -> {c.target_kind}{sel}")
-            if c.bp_mod_names:
-                lines.append(f"      BP ModActor: {', '.join(c.bp_mod_names)}")
-            if c.config_overrides:
-                lines.append(f"      WARNING Config override: {', '.join(c.config_overrides)}")
-        if manifest:
-            lines.append("")
-            lines.append("Deployed:")
-            for e in manifest:
-                lines.append(f"  - {e.deployed_name} ({e.kind})")
-                if self.conflict_report and e.deployed_name in self.conflict_report.per_pak:
-                    info = self.conflict_report.per_pak[e.deployed_name]
-                    if info["assets_won"] or info["assets_lost"]:
-                        lines.append(f"      wins {info['assets_won']} / loses {info['assets_lost']}")
-        LogDialog(lines, f"{mod.name} [{mod.badge}]", parent=self).exec()
+        ModDetailsDialog(
+            mod,
+            manifest,
+            self.conflict_report,
+            self.t,
+            on_visit_nexus=self._visit_nexus_page,
+            on_endorse_nexus=self._endorse_nexus_mod,
+            parent=self,
+        ).exec()
 
     def _on_item_changed(self, item: QTableWidgetItem) -> None:
         if self._suppress_table_signals or item.column() != 0:
@@ -1051,26 +1351,124 @@ class MainWindow(QMainWindow):
         mgr = self._manager()
         if mgr is None:
             return
+        ok = False
         try:
             mgr.set_enabled(mod_id, want_on)
+            ok = True
             self._log(f"{'Enabled' if want_on else 'Disabled'} {mod_id}")
         except DeployError as exc:
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
         self.refresh_all()
+        if ok and want_on:
+            self._notify_restart_if_game_running()
 
-    def _install_path(self, path: Path, name: Optional[str] = None, version: str = "") -> None:
+    def _prompt_update_existing(
+        self,
+        existing: ModRecord,
+        nexus_id: Optional[int],
+        allow_separate: bool = True,
+    ) -> tuple[str, bool]:
+        """Ask user whether to update existing mod on top, with a config-backup checkbox.
+
+        Returns (action, backup_configs) where action is 'update', 'separate', or 'cancel'.
+        """
+        dlg = QDialog(self)
+        dlg.setWindowTitle(self.t.tr("update.title"))
+        dlg.setMinimumWidth(420)
+        lay = QVBoxLayout(dlg)
+        lay.setSpacing(10)
+
+        nid_str = str(nexus_id) if nexus_id is not None else "-"
+        lbl = QLabel(
+            self.t.tr(
+                "update.confirm_body",
+                name=existing.name,
+                id=nid_str,
+                version=existing.version or "-",
+            )
+        )
+        lbl.setWordWrap(True)
+        lay.addWidget(lbl)
+
+        chk_bak = QCheckBox(self.t.tr("update.backup_configs"))
+        chk_bak.setChecked(True)
+        lay.addWidget(chk_bak)
+
+        result = {"action": "cancel"}
+        footer = QHBoxLayout()
+        footer.addStretch(1)
+
+        btn_cancel = QPushButton(self.t.tr("btn.cancel"))
+        btn_cancel.setFixedWidth(84)
+        btn_cancel.clicked.connect(dlg.reject)
+        footer.addWidget(btn_cancel)
+
+        if allow_separate:
+            btn_sep = QPushButton(self.t.tr("update.install_separate"))
+            btn_sep.clicked.connect(lambda: (result.__setitem__("action", "separate"), dlg.accept()))
+            footer.addWidget(btn_sep)
+
+        btn_upd = QPushButton(self.t.tr("btn.update"))
+        btn_upd.setFixedWidth(84)
+        btn_upd.setProperty("accent", True)
+        btn_upd.clicked.connect(lambda: (result.__setitem__("action", "update"), dlg.accept()))
+        footer.addWidget(btn_upd)
+
+        lay.addLayout(footer)
+        dlg.exec()
+        return result["action"], chk_bak.isChecked()
+
+    def _install_path(
+        self,
+        path: Path,
+        name: Optional[str] = None,
+        version: str = "",
+        nexus_mod_id: Optional[int] = None,
+    ) -> None:
         mgr = self._manager()
         if mgr is None:
             QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("cli.game_not_found"))
             return
+
+        resolved_nid = nexus_mod_id if nexus_mod_id is not None else parse_nexus_mod_id_from_filename(path.name)
+        if resolved_nid is not None:
+            existing = next(
+                (m for m in self.store.list_mods() if self._resolve_nexus_mod_id(m) == resolved_nid),
+                None,
+            )
+            if existing is not None:
+                action, backup_cfgs = self._prompt_update_existing(existing, resolved_nid, allow_separate=True)
+                if action == "cancel":
+                    return
+                if action == "update":
+                    try:
+                        rec, summaries = update_mod_preserving_configs(
+                            mgr,
+                            existing.id,
+                            path,
+                            new_version=version,
+                            backup_configs=backup_cfgs,
+                            nexus_mod_id=resolved_nid,
+                        )
+                        self._log(
+                            f"Updated {rec.name} (preserved {len(summaries)} config.lua"
+                            f"{', backed up configs' if backup_cfgs else ''})"
+                        )
+                    except Exception as exc:
+                        QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+                    self.refresh_all()
+                    return
+
         try:
-            rec = mgr.add_mod(path, name=name, version=version)
+            rec = mgr.add_mod(path, name=name, version=version, nexus_mod_id=resolved_nid)
             self._log(f"Added {rec.name} ({rec.id}) [{rec.badge}]")
         except DeployError as exc:
             if "loader DLL" in str(exc):
                 ans = QMessageBox.question(self, self.t.tr("app.title"), str(exc))
                 if ans == QMessageBox.StandardButton.Yes:
-                    rec = mgr.add_mod(path, name=name, version=version, allow_loaders=True)
+                    rec = mgr.add_mod(
+                        path, name=name, version=version, allow_loaders=True, nexus_mod_id=resolved_nid
+                    )
                     self._log(f"Added {rec.name} ({rec.id}) [loader confirmed]")
             else:
                 QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
@@ -1103,7 +1501,7 @@ class MainWindow(QMainWindow):
             return
 
         mods_dir_raw = settings.get("mods_archive_dir", "")
-        dl_dir = Path(mods_dir_raw) if mods_dir_raw else self.store.downloads_dir
+        dl_dir = Path(mods_dir_raw) if mods_dir_raw else (self.package_root / "downloads")
         auto_extract = bool(settings.get("auto_extract", False))
 
         self._dl_seq += 1
@@ -1123,14 +1521,14 @@ class MainWindow(QMainWindow):
                 self._refresh_downloads_tab(self.store.list_mods())
                 self.statusBar().showMessage(f"Downloading {fname} ({pct}% — {spd})" if pct >= 0 else f"Downloading {fname} ({spd})")
 
-        def _on_ok(did: int, dl_path_str: str, mod_name, mod_ver: str) -> None:
+        def _on_ok(did: int, dl_path_str: str, mod_name, mod_ver: str, nx_mod_id) -> None:
             self._dl_progress.pop(did, None)
             if worker in self._active_downloads:
                 self._active_downloads.remove(worker)
             dl_path = Path(dl_path_str)
             self._log(f"Downloaded: {dl_path.name}")
             if auto_extract:
-                self._install_path(dl_path, name=mod_name, version=mod_ver)
+                self._install_path(dl_path, name=mod_name, version=mod_ver, nexus_mod_id=nx_mod_id)
             else:
                 self.refresh_all()
             self.right_tabs.setCurrentWidget(self.tab_downloads)
@@ -1158,6 +1556,34 @@ class MainWindow(QMainWindow):
         if mgr is None or self.game is None:
             QMessageBox.warning(self, self.t.tr("app.title"), self.t.tr("cli.game_not_found"))
             return
+
+        # Warn if enabled mods need UE4SS or Pak Enabler that isn't installed in Win64/
+        prof = self.store.load_profile()
+        if prof.enabled_mods:
+            st = detect_mod_base(self.game)
+            enabled_recs = [m for m in (self.store.load_mod(mid) for mid in prof.enabled_mods) if m is not None]
+            needs_ue4ss = any(
+                c.kind in ("ue4ss_mod", "ue4ss_shared") and c.selected for m in enabled_recs for c in m.components
+            )
+            needs_paks = any(c.kind == "pak" and c.selected for m in enabled_recs for c in m.components)
+            missing: list[str] = []
+            if needs_ue4ss and not st.ue4ss.installed:
+                missing.append("UE4SS")
+            if needs_paks and not st.enabler.present:
+                missing.append("Pak Enabler")
+            if missing:
+                ans = QMessageBox.warning(
+                    self,
+                    self.t.tr("app.title"),
+                    self.t.tr("err.missing_mod_kit", missing=", ".join(missing)),
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans == QMessageBox.StandardButton.Yes:
+                    self._open_onboarding()
+                    self.refresh_all()
+                    return
+
         try:
             mgr.apply_profile()
         except DeployError as exc:
@@ -1254,6 +1680,10 @@ class MainWindow(QMainWindow):
 
         menu.addAction(act_details)
         menu.addAction(act_open)
+        mod = self.store.load_mod(mod_id)
+        nid = self._resolve_nexus_mod_id(mod)
+        if mod is not None and nid is not None:
+            self._append_nexus_menu_actions(menu, nid, mod.name, mod.version or "")
         menu.addSeparator()
         menu.addAction(act_up)
         menu.addAction(act_down)
@@ -1322,14 +1752,27 @@ class MainWindow(QMainWindow):
         mgr = self._manager()
         if mgr is None:
             return
+        existing = self.store.load_mod(mod_id)
+        if existing is None:
+            return
         chosen, _ = QFileDialog.getOpenFileName(
             self, self.t.tr("btn.update"), "", "Archives (*.zip *.7z *.rar *.pak);;All files (*.*)"
         )
         if not chosen:
             return
+        action, backup_cfgs = self._prompt_update_existing(
+            existing, self._resolve_nexus_mod_id(existing), allow_separate=False
+        )
+        if action != "update":
+            return
         try:
-            rec, summaries = update_mod_preserving_configs(mgr, mod_id, Path(chosen))
-            self._log(f"Updated {rec.name} (preserved {len(summaries)} config.lua)")
+            rec, summaries = update_mod_preserving_configs(
+                mgr, mod_id, Path(chosen), backup_configs=backup_cfgs
+            )
+            self._log(
+                f"Updated {rec.name} (preserved {len(summaries)} config.lua"
+                f"{', backed up configs' if backup_cfgs else ''})"
+            )
         except Exception as exc:
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
         self.refresh_all()

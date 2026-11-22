@@ -17,7 +17,9 @@ def _utc_now() -> str:
 
 
 def slugify_id(name: str) -> str:
-    s = re.sub(r"[^A-Za-z0-9._-]+", "_", name.strip()).strip("_.-")
+    """Sanitize a mod or profile name for use as a folder/file name (keeps spaces, strips illegal chars)."""
+    s = re.sub(r'[<>:"/\\|?*\x00-\x1f]+', " ", name.strip())
+    s = re.sub(r"\s+", " ", s).strip(" .")
     return s or "mod"
 
 

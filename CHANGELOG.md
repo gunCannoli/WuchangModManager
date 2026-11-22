@@ -5,13 +5,20 @@ All notable changes to **Wuchang Mod Manager (WMM)** are documented here.
 ## Unreleased (post v0.1.0-beta)
 
 ### UI & Profiles
-- Replaced the toolbar `+` button with a **Profiles** manager dialog supporting inline profile creation, cloning, and deletion.
-- Organized Settings into consistent grouped sections (`General`, `Nexus Mods`, `Downloads`, `Launch & Setup`) with aligned left-justified labels, uniform button widths, left-scrolled text inputs, and shorter `Steam launch` / `Re-run onboarding` labels.
-- Rebuilt the right-hand pane into MO2-style bottom tabs (`UE4SS`, `Paks`, `Downloads`) with responsive column sizing, per-mod enable/disable checkboxes that unlink disabled mods from the game folder, locked `Core` row for `Keybinds`, bold-italic `Unmanaged` styling with tooltips, and right-click context menus (`Open folder`, `Open config`, `Install archive`, `Delete download`).
+- Added a centered running-game lock modal (`WMM is locked while the game is running`) with a manual **Unlock** button; background `nxm://` downloads continue while locked, the lock auto-closes when the game exits, and enabling mods while unlocked alerts that changes apply after restarting the game.
+- Replaced the toolbar `+` button with a **Profiles** manager dialog supporting inline profile creation (28px row height for readable inline editing), cloning, and deletion.
+- Organized Settings into consistent grouped sections (`General`, `Nexus Mods`, `Downloads`, `Setup`) with tightly-fitted uniform left-aligned labels, uniform button widths, left-scrolled text inputs, and `Re-run onboarding` (removed unnecessary Desktop shortcut & Steam Launch Options since NTFS junctions/hardlinks stay active without WMM running).
+- Rebuilt the right-hand pane into MO2-style bottom tabs (`UE4SS`, `Paks`, `Downloads`) with responsive column sizing, per-mod enable/disable checkboxes that unlink disabled mods from the game folder, locked `Core` row for `Keybinds`, bold-italic `Unmanaged` styling with tooltips, unified `State` column on `Paks` (`● OK`, `● Overridden`, `● Conflict`, `● Unmanaged`), and right-click context menus (`Details...`, `Open folder`, `Open config`, `Visit Nexus page`, `Endorse on Nexus`, `Install archive`, `Delete download`).
+- Redesigned **Mod Details** into a grouped modal (`Overview`, `Components & Deployed`, `Overrides & Conflicts`) showing detailed winning overrides, losing overrides, config conflicts, and Nexus Mod ID actions.
+- Added Nexus mod ID auto-detection (from `nxm://` and manually downloaded Nexus archive filenames), storing `nexus_mod_id` on installed mods, plus update-on-top confirmation with a `Back up existing config files before updating` checkbox.
 - Fixed red/inactive cell highlight artifacts when switching right-panel tabs by switching table selection styling to neutral dark slate and clearing selection on tab change.
 - Added live download progress bar and transfer speed in the `Downloads` tab, non-blocking background downloads, and Settings toggles for auto-extract and keeping/deleting downloaded archives.
 
 ### Core & Deployment
+- Fixed `WMM_BPLoader` not spawning Blueprint mods like `Skip intro messages`: `apply_profile()` now syncs `WMM_BPLoader/wmm_bp_mods.txt`, `WMM_BPLoader/Scripts/main.lua` resolves `wmm_bp_mods.txt` relative to its own script directory (CWD-independent), and no longer skips startup/intro maps.
+- Improved responsive table column resizing across both left and right panels: shrinking a column expands the largest other column (or second-largest when shrinking the largest, with ties preferring `State`/`Status`) so no dead space appears.
+- Renamed the default downloads folder from `wmm\mods\` to `wmm\downloads\` (avoiding confusion with `wmm\data\mods\`) and updated `slugify_id()` to preserve spaces in mod/profile folder names instead of replacing them with underscores.
+- Nexus `nxm://` downloads now fetch the real archive filename via `get_mod_file_info()` instead of saving CDN UUID filenames.
 - Fixed profile switching leaking disabled managed UE4SS mods into `mods.txt` as `Unmanaged`: inactive managed UE4SS mods are now pruned cleanly from `mods.txt` while preserving unmanaged entries and keeping `Keybinds : 1` last.
 - Fixed Nexus `nxm://` CDN downloads with extensionless UUID filenames via `Content-Disposition` parsing and archive magic-byte sniffing.
 - Replaced VRR / No VRR `Engine.ini` presets with performance-only `Performance (Default)` and `Performance (VRR)` presets (no visual/sharpness changes) and added an `Engine.ini` preset selector in Settings.

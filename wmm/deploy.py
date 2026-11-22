@@ -98,13 +98,17 @@ class Manager:
         game: GameInstall,
         platform: Optional[Platform] = None,
         tools_dir: Optional[Path] = None,
+        allow_while_running: bool = False,
     ):
         self.store = store
         self.game = game
         self.platform = platform or get_platform()
         self.tools_dir = tools_dir
+        self.allow_while_running = allow_while_running
 
     def _assert_game_closed(self) -> None:
+        if self.allow_while_running:
+            return
         running = running_game_processes(self.platform)
         if running:
             raise DeployError(f"Game is running ({', '.join(running)}); close it before changing files.")
@@ -129,6 +133,7 @@ class Manager:
         allow_loaders: bool = False,
         selected_variants: Optional[set[str]] = None,
         keep_archive: Optional[bool] = None,
+        nexus_mod_id: Optional[int] = None,
     ) -> ModRecord:
         """Extract/inspect source (archive or folder), store files once under data/mods/<id>/."""
         source = Path(source)
@@ -185,12 +190,18 @@ class Manager:
                 rec.selected = is_selected
                 comp_records.append(rec)
 
+            resolved_nexus_id = nexus_mod_id
+            if resolved_nexus_id is None:
+                from .nexus import parse_nexus_mod_id_from_filename
+                resolved_nexus_id = parse_nexus_mod_id_from_filename(source.name)
+
             record = ModRecord(
                 id=mod_id,
                 name=mod_name,
                 version=version,
                 badge=det.badge,
                 source=str(source),
+                nexus_mod_id=resolved_nexus_id,
                 components=comp_records,
             )
             self.store.save_mod(record)
@@ -411,25 +422,33 @@ class Manager:
         self.apply_profile(prof)
         return prof
 
-    def _undeploy_manifest(self, manifest: list[ManifestEntry]) -> None:
+    def _undeploy_manifest(self, manifest: list[ManifestEntry], keep_paths: Optional[set[str]] = None) -> None:
         """Cleanly undo every manifest entry without touching unmanaged files."""
+        keep_lower = {p.lower() for p in (keep_paths or set())}
         for entry in reversed(manifest):
             target = Path(entry.path)
             store_path = Path(entry.store_path)
+            if str(target).lower() in keep_lower and target.exists():
+                continue
 
-            if entry.kind == "pak_hardlink":
-                if target.exists():
-                    target.unlink()
-            elif entry.kind == "pak_move":
-                if target.exists():
-                    store_path.parent.mkdir(parents=True, exist_ok=True)
-                    shutil.move(str(target), str(store_path))
-            elif entry.kind in ("ue4ss_junction", "ue4ss_shared_junction"):
-                if self.platform.is_dir_link(target):
-                    self.platform.remove_dir_link(target)
-            elif entry.kind == "ini_block":
-                if self.game.engine_ini_path is not None and self.game.engine_ini_path.is_file():
-                    apply_ini_tweak_block(self.game.engine_ini_path, entry.mod_id, None)
+            try:
+                if entry.kind == "pak_hardlink":
+                    if target.exists():
+                        target.unlink()
+                elif entry.kind == "pak_move":
+                    if target.exists():
+                        store_path.parent.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(target), str(store_path))
+                elif entry.kind in ("ue4ss_junction", "ue4ss_shared_junction"):
+                    if self.platform.is_dir_link(target):
+                        self.platform.remove_dir_link(target)
+                elif entry.kind == "ini_block":
+                    if self.game.engine_ini_path is not None and self.game.engine_ini_path.is_file():
+                        apply_ini_tweak_block(self.game.engine_ini_path, entry.mod_id, None)
+            except PermissionError as exc:
+                raise DeployError(
+                    f"'{target.name}' is currently locked by the running game. Close the game to remove or modify it."
+                ) from exc
 
             if entry.backup_path:
                 bp = Path(entry.backup_path)
@@ -460,6 +479,10 @@ class Manager:
                     remove_names=all_managed_names,
                 )
 
+        if (self.game.ue4ss_mods_dir / "WMM_BPLoader").is_dir():
+            from .base import sync_wmm_lua_bploader_list
+            sync_wmm_lua_bploader_list(self.game, [])
+
         if self.game.engine_ini_path is not None and self.game.engine_ini_path.is_file():
             update_wmm_bp_section(self.game.engine_ini_path, [], backup_dir=self.store.backup_dir)
         return count
@@ -469,19 +492,15 @@ class Manager:
         self._assert_game_closed()
         prof = profile or self.store.load_profile()
 
-        # 1. Undo current WMM manifest so moves/renames start from clean store state
+        # 1. Gather enabled mods & compute desired pak names first so locked hardlinks
+        #    that stay unchanged can be kept in place when allow_while_running=True.
         old_manifest = self.store.load_manifest()
-        self._undeploy_manifest(old_manifest)
-        new_manifest: list[ManifestEntry] = []
-
-        # 2. Gather enabled mods
         enabled_mods: list[ModRecord] = []
         for mid in prof.enabled_mods:
             rec = self.store.load_mod(mid)
             if rec is not None:
                 enabled_mods.append(rec)
 
-        # 3. Compute custom pak order filenames
         pak_items: list[tuple[ModRecord, ModComponentRecord]] = []
         for mod in enabled_mods:
             for comp in mod.components:
@@ -503,6 +522,22 @@ class Manager:
         ]
         deployed_names = assign_custom_order_names(order_spec, rule=rule)
 
+        keep_paths: set[str] = set()
+        if self.allow_while_running:
+            desired_map = {}
+            for mod, comp in pak_items:
+                tdir = self.game.logic_mods_dir if comp.target_kind == "LogicMods" else self.game.mods_pak_dir
+                dep_name = deployed_names[f"{mod.id}:{comp.name}"]
+                desired_map[str(tdir / dep_name).lower()] = str(self.store.mod_dir(mod.id) / comp.store_rel).lower()
+            for e in old_manifest:
+                if e.kind == "pak_hardlink" and e.path.lower() in desired_map:
+                    if desired_map[e.path.lower()] == e.store_path.lower():
+                        keep_paths.add(e.path)
+
+        # Undo current WMM manifest (skipping unchanged locked hardlinks if game is running)
+        self._undeploy_manifest(old_manifest, keep_paths=keep_paths)
+        new_manifest: list[ManifestEntry] = []
+
         # 4. Deploy paks (hardlink on same volume, move on cross-volume)
         bp_mod_names: list[str] = []
         for mod, comp in pak_items:
@@ -515,8 +550,12 @@ class Manager:
 
             dep_name = deployed_names[f"{mod.id}:{comp.name}"]
             dst_pak = target_dir / dep_name
-            backup = self._backup_existing(dst_pak)
-            mode = self.platform.hardlink_or_move(src_pak, dst_pak)
+            if dst_pak.exists() and str(dst_pak) in keep_paths:
+                backup = None
+                mode = "hardlink"
+            else:
+                backup = self._backup_existing(dst_pak)
+                mode = self.platform.hardlink_or_move(src_pak, dst_pak)
             new_manifest.append(
                 ManifestEntry(
                     path=str(dst_pak),
@@ -620,7 +659,11 @@ class Manager:
                 remove_names=inactive_managed,
             )
 
-        # 6. Update Engine.ini for BP mods & ini tweaks
+        # 6. Sync WMM Lua BP loader list (if installed) & Engine.ini for BP mods & ini tweaks
+        if (self.game.ue4ss_mods_dir / "WMM_BPLoader").is_dir():
+            from .base import sync_wmm_lua_bploader_list
+            sync_wmm_lua_bploader_list(self.game, bp_mod_names)
+
         if self.game.engine_ini_path is not None and (bp_mod_names or self.game.engine_ini_path.is_file()):
             if bp_mod_names or any(e.kind == "ini_block" for e in old_manifest):
                 update_wmm_bp_section(

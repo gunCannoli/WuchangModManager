@@ -8,7 +8,6 @@ from typing import Optional
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -24,7 +23,6 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..cli import create_desktop_shortcut, steam_launch_option_string
 from ..deploy import DeployError, Manager
 from ..engineini import apply_perf_preset, backup_engine_ini, read_perf_preset_mode
 from ..game import GameInstall, running_game_processes, validate_game_root
@@ -58,7 +56,7 @@ class SettingsDialog(QDialog):
 
     def _make_label(self, text: str) -> QLabel:
         lbl = QLabel(text)
-        lbl.setFixedWidth(96)
+        lbl.setFixedWidth(self._label_width)
         lbl.setAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         return lbl
 
@@ -68,11 +66,22 @@ class SettingsDialog(QDialog):
         root.setSpacing(10)
         btn_width = 80
 
+        # Compute tight uniform width from the longest form label so there is no excess gap
+        fm = self.fontMetrics()
+        label_texts = (
+            self.t.tr("settings.game_path"),
+            self.t.tr("settings.language"),
+            self.t.tr("onboarding.step_ini"),
+            self.t.tr("settings.nexus_key"),
+        )
+        self._label_width = max(fm.horizontalAdvance(t) for t in label_texts) + 6
+
         # 1. General (Game folder, Language, Engine.ini performance preset)
         gen_group = QGroupBox(self.t.tr("settings.general_group").replace("&", "&&"))
         gen_form = QFormLayout(gen_group)
         gen_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        gen_form.setSpacing(8)
+        gen_form.setHorizontalSpacing(8)
+        gen_form.setVerticalSpacing(8)
 
         game_row = QHBoxLayout()
         self.edit_game = QLineEdit(str(self.game.root) if self.game else settings.get("game_path", ""))
@@ -117,13 +126,18 @@ class SettingsDialog(QDialog):
         ini_row.addWidget(self.combo_perf, 1)
         ini_row.addWidget(btn_apply_ini)
         gen_form.addRow(self._make_label(self.t.tr("onboarding.step_ini")), ini_row)
+
+        self.chk_show_ue4ss_core = QCheckBox(self.t.tr("settings.show_ue4ss_core"))
+        self.chk_show_ue4ss_core.setChecked(bool(settings.get("show_ue4ss_core", False)))
+        gen_form.addRow(self.chk_show_ue4ss_core)
         root.addWidget(gen_group)
 
         # 2. Nexus Mods (API key, nxm:// handler)
         nexus_group = QGroupBox(self.t.tr("settings.nexus_group").replace("&", "&&"))
         nexus_form = QFormLayout(nexus_group)
         nexus_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        nexus_form.setSpacing(8)
+        nexus_form.setHorizontalSpacing(8)
+        nexus_form.setVerticalSpacing(8)
 
         self.edit_api = QLineEdit()
         self.edit_api.setEchoMode(QLineEdit.EchoMode.Password)
@@ -139,7 +153,7 @@ class SettingsDialog(QDialog):
 
         self.chk_nxm = QCheckBox(self.t.tr("settings.nxm_handler"))
         self.chk_nxm.setChecked(bool(settings.get("nxm_registered", False)))
-        nexus_form.addRow(self._make_label(""), self.chk_nxm)
+        nexus_form.addRow(self.chk_nxm)
         root.addWidget(nexus_group)
 
         # 3. Downloads (Auto-extract, Keep archives)
@@ -154,37 +168,14 @@ class SettingsDialog(QDialog):
         dl_lay.addWidget(self.chk_keep)
         root.addWidget(dl_group)
 
-        # 4. Launch & Setup (Steam launch, Re-run onboarding, Desktop shortcut)
-        launch_group = QGroupBox(self.t.tr("settings.launch_group").replace("&", "&&"))
-        launch_lay = QVBoxLayout(launch_group)
-        launch_lay.setSpacing(8)
-
-        launch_form = QFormLayout()
-        launch_form.setLabelAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        launch_form.setSpacing(8)
-        launch_row = QHBoxLayout()
-        self.edit_steam_launch = QLineEdit(steam_launch_option_string())
-        self.edit_steam_launch.setReadOnly(True)
-        self.edit_steam_launch.setAlignment(Qt.AlignmentFlag.AlignLeft)
-        self.edit_steam_launch.setCursorPosition(0)
-        btn_copy_launch = QPushButton(self.t.tr("btn.copy"))
-        btn_copy_launch.setFixedWidth(btn_width)
-        btn_copy_launch.clicked.connect(self._copy_steam_launch)
-        launch_row.addWidget(self.edit_steam_launch, 1)
-        launch_row.addWidget(btn_copy_launch)
-        launch_form.addRow(self._make_label(self.t.tr("settings.steam_launch")), launch_row)
-        launch_lay.addLayout(launch_form)
-
-        tools_row = QHBoxLayout()
+        # 4. Setup (Re-run onboarding)
+        setup_group = QGroupBox(self.t.tr("settings.setup_group").replace("&", "&&"))
+        setup_lay = QHBoxLayout(setup_group)
         btn_base = QPushButton(self.t.tr("settings.run_onboarding"))
         btn_base.clicked.connect(self._open_mod_base)
-        btn_shortcut = QPushButton(self.t.tr("btn.desktop_shortcut"))
-        btn_shortcut.clicked.connect(self._create_shortcut)
-        tools_row.addWidget(btn_base)
-        tools_row.addWidget(btn_shortcut)
-        tools_row.addStretch(1)
-        launch_lay.addLayout(tools_row)
-        root.addWidget(launch_group)
+        setup_lay.addWidget(btn_base)
+        setup_lay.addStretch(1)
+        root.addWidget(setup_group)
 
         # Save / Cancel (same fixed width as action buttons)
         footer = QHBoxLayout()
@@ -232,16 +223,6 @@ class SettingsDialog(QDialog):
         except Exception as exc:
             QMessageBox.critical(self, self.t.tr("app.title"), str(exc))
 
-    def _copy_steam_launch(self) -> None:
-        QApplication.clipboard().setText(self.edit_steam_launch.text())
-
-    def _create_shortcut(self) -> None:
-        try:
-            sc = create_desktop_shortcut(self.game)
-            QMessageBox.information(self, self.t.tr("app.title"), self.t.tr("settings.shortcut_created", path=str(sc)))
-        except Exception as exc:
-            QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
-
     def _open_mod_base(self) -> None:
         dlg = OnboardingDialog(self.store, self.t, game=self.game, package_root=self.package_root, parent=self)
         if dlg.exec() == QDialog.DialogCode.Accepted and dlg.game is not None:
@@ -275,6 +256,7 @@ class SettingsDialog(QDialog):
 
         api_key = self.edit_api.text().strip()
         settings["nexus_api_key"] = self.plat.protect_secret(api_key) if api_key else ""
+        settings["show_ue4ss_core"] = self.chk_show_ue4ss_core.isChecked()
         settings["auto_extract"] = self.chk_auto_extract.isChecked()
         settings["keep_archives"] = self.chk_keep.isChecked()
 

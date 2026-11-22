@@ -20,7 +20,20 @@ WMM_LUA_BPLOADER_SCRIPT = """-- WMM_BPLoader (Lua mode): spawns Blueprint ModAct
 -- Runs via UE4SS without claiming GameDefaultMap.
 local UEHelpers = require("UEHelpers")
 
-local MOD_LIST_FILE = "Mods/WMM_BPLoader/wmm_bp_mods.txt"
+local function resolve_mod_list_path()
+    local src = debug.getinfo(1, "S").source or ""
+    if src:sub(1, 1) == "@" then
+        src = src:sub(2)
+    end
+    -- Script lives in .../Mods/WMM_BPLoader/Scripts/main.lua -> parent is .../Mods/WMM_BPLoader
+    local dir = src:match("^(.*)[/\\\\]Scripts[/\\\\][^/\\\\]+$")
+    if dir and dir ~= "" then
+        return dir .. "/wmm_bp_mods.txt"
+    end
+    return "ue4ss/Mods/WMM_BPLoader/wmm_bp_mods.txt"
+end
+
+local MOD_LIST_FILE = resolve_mod_list_path()
 local spawned = {}
 
 local function log(msg)
@@ -29,8 +42,11 @@ end
 
 local function read_mod_list()
     local out = {}
-    local f = io.open(MOD_LIST_FILE, "r")
-    if not f then return out end
+    local f = io.open(MOD_LIST_FILE, "r") or io.open("Mods/WMM_BPLoader/wmm_bp_mods.txt", "r")
+    if not f then
+        log("cannot open mod list: " .. tostring(MOD_LIST_FILE))
+        return out
+    end
     for line in f:lines() do
         local name = line:match("^%s*([^;#%s][^\\r\\n]-)%s*$")
         if name and name ~= "" then
@@ -73,9 +89,7 @@ local function spawn_all_for_world(world)
     if not world or not world:IsValid() then return end
     local wname = ""
     pcall(function() wname = world:GetFullName() end)
-    if wname == "" or wname:find("Entry", 1, true) or wname:find("GameInitMap", 1, true) then
-        return
-    end
+    if wname == "" then return end
     if spawned[wname] then return end
     spawned[wname] = true
     local list = read_mod_list()
@@ -96,7 +110,7 @@ RegisterHook("/Script/Engine.PlayerController:ClientRestart", function(ctx)
     end
 end)
 
-log("loaded (Lua BP loader mode)")
+log("loaded (Lua BP loader mode, list=" .. tostring(MOD_LIST_FILE) .. ")")
 """
 
 

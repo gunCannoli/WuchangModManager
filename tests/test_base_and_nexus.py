@@ -162,14 +162,30 @@ class TestBaseAndNexus(unittest.TestCase):
             (v2 / "Scripts" / "main.lua").write_text("-- v2\n", encoding="utf-8")
             (v2 / "config.lua").write_text("return {\n    Scale = 1.0,\n    NewKey = 7,\n}\n", encoding="utf-8")
 
-            updated_rec, summaries = update_mod_preserving_configs(mgr, rec.id, v2.parent, new_version="2.0")
+            updated_rec, summaries = update_mod_preserving_configs(
+                mgr, rec.id, v2.parent, new_version="2.0", backup_configs=True, nexus_mod_id=500
+            )
             self.assertEqual(updated_rec.version, "2.0")
+            self.assertEqual(updated_rec.nexus_mod_id, 500)
             final_cfg = live_cfg.read_text(encoding="utf-8")
             self.assertIn("Scale = 2.5,", final_cfg)
             self.assertIn("NewKey = 7,", final_cfg)
             self.assertNotIn("OldKey", final_cfg)
             self.assertNotIn(b"\r\n", live_cfg.read_bytes())
             self.assertTrue(bool(summaries))
+            # Verify config backup directory was created
+            bak_dirs = list(store.backup_dir.glob(f"config_{rec.id}_*"))
+            self.assertEqual(len(bak_dirs), 1)
+            self.assertTrue((bak_dirs[0] / "ue4ss" / "MyMod" / "config.lua").is_file())
+
+    def test_parse_nexus_mod_id_from_filename(self) -> None:
+        from wmm.nexus import parse_nexus_mod_id_from_filename
+
+        self.assertEqual(parse_nexus_mod_id_from_filename("WMF 500 1.0.0 2026-11-20T05-00Z yPd43amsq.zip"), 500)
+        self.assertEqual(parse_nexus_mod_id_from_filename("PhotoMode-123-2-1-0-1732000000.7z"), 123)
+        self.assertEqual(parse_nexus_mod_id_from_filename("BoingPower-42-1.4.2-1730000000.zip"), 42)
+        self.assertIsNone(parse_nexus_mod_id_from_filename("CustomMod_2026.zip"))
+        self.assertIsNone(parse_nexus_mod_id_from_filename("RandomArchive.zip"))
 
 
 if __name__ == "__main__":
