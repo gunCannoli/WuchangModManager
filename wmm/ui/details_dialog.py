@@ -13,7 +13,10 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
-    QPlainTextEdit,
+    QAbstractItemView,
+    QHeaderView,
+    QTableWidget,
+    QTableWidgetItem,
     QPushButton,
     QVBoxLayout,
     QWidget,
@@ -35,6 +38,8 @@ class ModDetailsDialog(QDialog):
         on_visit_nexus: Optional[Callable[[int], None]] = None,
         on_endorse_nexus: Optional[Callable[[int, str, str], None]] = None,
         on_rename: Optional[Callable[[str], None]] = None,
+        store_dir: Optional[Path] = None,
+        pak_owner: Optional[dict[str, str]] = None,
         parent: Optional[QWidget] = None,
     ):
         super().__init__(parent)
@@ -45,6 +50,8 @@ class ModDetailsDialog(QDialog):
         self.on_visit_nexus = on_visit_nexus
         self.on_endorse_nexus = on_endorse_nexus
         self.on_rename = on_rename
+        self.store_dir = store_dir
+        self.pak_owner = pak_owner or {}
 
         self.nexus_id: Optional[int] = mod.nexus_mod_id
         if self.nexus_id is None and mod.source:
@@ -139,32 +146,46 @@ class ModDetailsDialog(QDialog):
         # 2. Components & Deployed section
         comp_group = QGroupBox(self.t.tr("details.components_group").replace("&", "&&"))
         comp_lay = QVBoxLayout(comp_group)
-        comp_view = QPlainTextEdit()
-        comp_view.setReadOnly(True)
-        comp_lines: list[str] = []
+        deployed_as = {e.original_name: e.deployed_name for e in self.manifest}
+        rows = []
         for c in self.mod.components:
-            sel = "" if c.selected else " (disabled)"
-            comp_lines.append(f"[{c.kind}] {c.name} -> {c.target_kind}{sel}")
+            kind = c.kind + ("" if c.selected else " (disabled)")
+            loc = str(self.store_dir / c.store_rel) if self.store_dir is not None else c.store_rel
+            rows.append((kind, c.name, loc, deployed_as.get(c.name, "")))
             if c.bp_mod_names:
-                comp_lines.append(f"    BP ModActor: {', '.join(c.bp_mod_names)}")
+                rows.append(("BP ModActor", ", ".join(c.bp_mod_names), "", ""))
             if c.config_overrides:
-                comp_lines.append(f"    WARNING Config override: {', '.join(c.config_overrides)}")
-        if self.manifest:
-            comp_lines.append("")
-            comp_lines.append("Deployed:")
-            for e in self.manifest:
-                comp_lines.append(f"  {e.deployed_name} ({e.kind})")
-        comp_view.setPlainText("\n".join(comp_lines) or "-")
-        comp_view.setMaximumHeight(130)
+                rows.append(("Config override", ", ".join(c.config_overrides), "", ""))
+        comp_view = self._make_table(
+            [
+                self.t.tr("col.type"),
+                self.t.tr("tabcol.file"),
+                self.t.tr("details.col_stored"),
+                self.t.tr("details.col_deployed"),
+            ],
+            rows,
+            stretch=2,
+        )
+        comp_view.setMaximumHeight(150)
         comp_lay.addWidget(comp_view)
         root.addWidget(comp_group)
 
         # 3. Overrides & Conflicts section (Winning overrides, Losing overrides, Config conflicts)
         ov_conf_group = QGroupBox(self.t.tr("details.overrides_group").replace("&", "&&"))
         ov_conf_lay = QVBoxLayout(ov_conf_group)
-        self.overrides_view = QPlainTextEdit()
-        self.overrides_view.setReadOnly(True)
-        self.overrides_view.setPlainText(self._build_overrides_text())
+        conflict_rows = self._build_conflict_rows()
+        self.overrides_view = self._make_table(
+            [
+                self.t.tr("details.col_relation"),
+                self.t.tr("details.col_ref_mod"),
+                self.t.tr("details.col_pak"),
+                self.t.tr("tabcol.file"),
+            ],
+            conflict_rows,
+            stretch=3,
+        )
+        if not conflict_rows:
+            ov_conf_lay.addWidget(QLabel(self.t.tr("details.no_overrides")))
         ov_conf_lay.addWidget(self.overrides_view)
         root.addWidget(ov_conf_group, 1)
 
@@ -186,47 +207,48 @@ class ModDetailsDialog(QDialog):
         self.setWindowTitle(f"{new} [{self.mod.badge}]")
         self.btn_rename.setEnabled(False)
 
-    def _build_overrides_text(self) -> str:
+    def _make_table(self, headers: list[str], rows: list[tuple], stretch: int) -> QTableWidget:
+        tbl = QTableWidget(len(rows), len(headers))
+        tbl.setHorizontalHeaderLabels(headers)
+        tbl.verticalHeader().setVisible(False)
+        tbl.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        tbl.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        tbl.setShowGrid(False)
+        tbl.setAlternatingRowColors(True)
+        hh = tbl.horizontalHeader()
+        for c in range(len(headers)):
+            hh.setSectionResizeMode(c, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(stretch, QHeaderView.ResizeMode.Stretch)
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                it = QTableWidgetItem(str(val))
+                it.setToolTip(str(val))
+                tbl.setItem(r, c, it)
+        return tbl
+
+    def _build_conflict_rows(self) -> list[tuple[str, str, str, str]]:
+        """(relation, reference mod, pak, file) rows: who we override, who overrides us, config overrides."""
         deployed_paks = {
             e.deployed_name
             for e in self.manifest
             if e.kind.startswith("pak_") and e.deployed_name.lower().endswith(".pak")
         }
-        winning: list[str] = []
-        losing: list[str] = []
-        cfg_lines: list[str] = []
+        rows: list[tuple[str, str, str, str]] = []
 
-        for c in self.mod.components:
-            if c.config_overrides:
-                cfg_lines.append(f"  {c.name}: {', '.join(c.config_overrides)}")
+        def owner(pak: str) -> str:
+            return self.pak_owner.get(pak, self.t.tr("status.unmanaged"))
 
         if self.conflict_report and deployed_paks:
             for asset, owners in sorted(self.conflict_report.asset_owners.items()):
-                winner = owners[-1]
-                losers = owners[:-1]
+                winner, losers = owners[-1], owners[:-1]
                 if winner in deployed_paks:
-                    other_losers = [o for o in losers if o not in deployed_paks]
-                    if other_losers:
-                        winning.append(f"  [{winner}] {asset}\n      overrides: {', '.join(other_losers)}")
-                for lp in losers:
-                    if lp in deployed_paks and winner not in deployed_paks:
-                        losing.append(f"  [{lp}] {asset}\n      overridden by: {winner}")
-
-        sections: list[str] = []
-        if winning:
-            sections.append(f"{self.t.tr('details.winning_overrides')} ({len(winning)}):")
-            sections.extend(winning)
-        if losing:
-            if sections:
-                sections.append("")
-            sections.append(f"{self.t.tr('details.losing_overrides')} ({len(losing)}):")
-            sections.extend(losing)
-        if cfg_lines:
-            if sections:
-                sections.append("")
-            sections.append(f"{self.t.tr('details.config_conflicts')} ({len(cfg_lines)}):")
-            sections.extend(cfg_lines)
-
-        if not sections:
-            return self.t.tr("details.no_overrides")
-        return "\n".join(sections)
+                    for lp in losers:
+                        if lp not in deployed_paks:
+                            rows.append((self.t.tr("details.rel_overrides"), owner(lp), lp, asset))
+                elif any(lp in deployed_paks for lp in losers):
+                    rows.append((self.t.tr("details.rel_overridden_by"), owner(winner), winner, asset))
+        for c in self.mod.components:
+            for cfg in c.config_overrides:
+                rows.append((self.t.tr("details.rel_config"), "-", c.name, cfg))
+        rows.sort(key=lambda r: (r[0], r[1].lower(), r[2].lower(), r[3].lower()))
+        return rows

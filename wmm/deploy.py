@@ -7,7 +7,7 @@ import tempfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .detect import DetectedComponent, DetectionResult, detect_mod
 from .engineini import apply_ini_tweak_block, update_wmm_bp_section
@@ -99,12 +99,21 @@ class Manager:
         platform: Optional[Platform] = None,
         tools_dir: Optional[Path] = None,
         allow_while_running: bool = False,
+        log: Optional[Callable[[str, str], None]] = None,
     ):
+        self._log_cb = log
         self.store = store
         self.game = game
         self.platform = platform or get_platform()
         self.tools_dir = tools_dir
         self.allow_while_running = allow_while_running
+
+    def _log(self, msg: str, level: str = "INFO") -> None:
+        if self._log_cb is not None:
+            try:
+                self._log_cb(msg, level)
+            except Exception:  # noqa: BLE001 - logging must never break an install
+                pass
 
     def _assert_game_closed(self) -> None:
         if self.allow_while_running:
@@ -147,13 +156,20 @@ class Manager:
         tmp_dir: Optional[Path] = None
         try:
             if is_archive:
-                tmp_dir = Path(tempfile.mkdtemp(prefix="wmm_ext_", dir=str(self.store.downloads_dir)))
+                self._log(f"Extracting {source.name} ({source.stat().st_size / 1048576:.1f} MB)")
+                tmp_dir = self.store.new_tmp_dir()
                 extract_archive(source, tmp_dir, tools_dir=self.tools_dir)
                 inspect_root = tmp_dir
             else:
                 inspect_root = source
 
             det = detect_mod(inspect_root, aes_key_hex=aes_key)
+            self._log(
+                f"Detected [{det.badge}] in {source.name}: "
+                + (", ".join(f"{c.kind}:{c.name}" for c in det.components) or "no components")
+            )
+            for w in getattr(det, "warnings", []) or []:
+                self._log(f"{source.name}: {w}", "WARN")
             if det.has_loader and not allow_loaders:
                 loaders = [c.name for c in det.components if c.kind == "loader"]
                 raise DeployError(
@@ -212,6 +228,7 @@ class Manager:
                 components=comp_records,
             )
             self.store.save_mod(record)
+            self._log(f"Stored {mod_id} with {len(comp_records)} component(s) in {mod_store_dir}")
 
             # Delete archive after install if keep_archives is False and it lives in WMM's downloads/mods folder
             if keep_archive is None:
@@ -702,4 +719,11 @@ class Manager:
                             )
 
         self.store.save_manifest(new_manifest)
+        kinds: dict[str, int] = {}
+        for e in new_manifest:
+            kinds[e.kind] = kinds.get(e.kind, 0) + 1
+        self._log(
+            f"Deployed profile '{prof.name}': {len(enabled_mods)} mod(s) enabled, "
+            + (", ".join(f"{n} {k}" for k, n in sorted(kinds.items())) or "nothing to link")
+        )
         return new_manifest

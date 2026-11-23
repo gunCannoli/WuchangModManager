@@ -2,6 +2,14 @@
 
 All notable changes to **Wuchang Mod Manager (WMM)** are documented here.
 
+## v0.6.5-beta (2026-11-22)
+
+- Update / install prompt: one dropdown to pick the mod to override (same Nexus id or similar name, closest file name first) or install as a new mod. Update now records the archive's version.
+- Mod Details: Components table (Type, File, Stored location, Deployed as) and Overrides table (Relation, Reference mod, Pak, File).
+- A finished download refreshes the Downloads list before the install prompt opens (no duplicate 100% row).
+- Log dialog: one row per event (Date / time, Level, Event), right-click copies the line(s) or the entire log; mirrored to `data/logs/wmm.log`; install, extraction, deploy and unhandled errors are logged.
+- Manually added archives no longer fail when `data/downloads` is missing: extraction uses `data/tmp` (created on demand); WMM stops creating `data/downloads` (archives live in `<WMM>/downloads`). Any other install failure is logged and shown instead of failing silently.
+
 ## v0.6.0-beta (2026-11-22)
 
 - Icon toolbar, mod filter box, sortable column titles; Refresh button.

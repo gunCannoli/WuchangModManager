@@ -120,7 +120,7 @@ class TestUI(unittest.TestCase):
 
             first_mod = win.store.list_mods()[0]
             dd = ModDetailsDialog(first_mod, win.store.load_manifest(), win.conflict_report, t)
-            self.assertIn("No asset overrides", dd.overrides_view.toPlainText())
+            self.assertEqual(dd.overrides_view.rowCount(), 0)
 
             dd.close()
             pd.close()
@@ -374,3 +374,22 @@ class TestRightPanelActions(unittest.TestCase):
             self.assertTrue(made[2].exists())
             for m in made:
                 m.unlink(missing_ok=True)
+
+
+@unittest.skipUnless(HAS_PYSIDE6, "PySide6 not installed")
+class TestLogDialog(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_rows_have_timestamp_column(self) -> None:
+        from wmm.applog import AppLog
+        from wmm.ui.main_window import LogDialog
+
+        log = AppLog()
+        log.add("first")
+        log.add("second", "error")
+        dlg = LogDialog(log.entries, "Log")
+        self.assertEqual(dlg.view.rowCount(), 2)
+        self.assertRegex(dlg.view.item(0, 0).text(), r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d$")
+        self.assertEqual(dlg.view.item(1, 2).text(), "second")

@@ -334,6 +334,42 @@ class NexusClient:
         return dest
 
 
+def _norm_name(text: str) -> str:
+    parsed = parse_nexus_archive_name(text)
+    base = parsed[0] if parsed else Path(text).stem
+    return re.sub(r"[^a-z0-9]+", "", base.lower())
+
+
+def rank_update_targets(
+    archive_name: str,
+    mods: list[ModRecord],
+    resolve_nexus_id: Callable[[ModRecord], Optional[int]],
+    nexus_id: Optional[int],
+) -> list[ModRecord]:
+    """Installed mods an archive could override: same Nexus mod id or a similar name, closest file name first.
+
+    Several files of one Nexus mod (e.g. "Weapons Swing Enhanced" and "Player Movement Tweaks", both #233)
+    are separate installed mods, so the caller shows all of them and lets the user pick.
+    """
+    import difflib
+
+    arc = _norm_name(archive_name)
+    arc_stem = re.sub(r"[^a-z0-9]+", "", Path(archive_name).stem.lower())
+    scored: list[tuple[float, ModRecord]] = []
+    for m in mods:
+        names = [re.sub(r"[^a-z0-9]+", "", m.name.lower())]
+        if m.source:
+            names.append(_norm_name(Path(m.source).name))
+        best = max((difflib.SequenceMatcher(None, arc, n).ratio() for n in names if n), default=0.0)
+        if m.source and re.sub(r"[^a-z0-9]+", "", Path(m.source).stem.lower()) == arc_stem:
+            best = max(best, 0.9 + 0.1 * difflib.SequenceMatcher(None, arc, names[0]).ratio())  # same archive installed before; name breaks ties
+        same_id = nexus_id is not None and resolve_nexus_id(m) == nexus_id
+        if same_id or best >= 0.7:
+            scored.append((best + (0.05 if same_id else 0.0), m))
+    scored.sort(key=lambda t: t[0], reverse=True)
+    return [m for _, m in scored]
+
+
 def update_mod_preserving_configs(
     manager: Manager,
     mod_id: str,
@@ -346,6 +382,9 @@ def update_mod_preserving_configs(
     old_mod = manager.store.load_mod(mod_id)
     if old_mod is None:
         raise NexusError(f"Mod not found: {mod_id}")
+    if not new_version:
+        parsed = parse_nexus_archive_name(Path(new_source).name)
+        new_version = parsed[2] if parsed else ""
 
     old_mod_dir = manager.store.mod_dir(mod_id)
     # Snapshot existing user config.lua files before replacing

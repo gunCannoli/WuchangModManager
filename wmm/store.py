@@ -115,7 +115,9 @@ class Store:
         self.data_dir = Path(data_dir)
         self.mods_dir = self.data_dir / "mods"
         self.profiles_dir = self.data_dir / "profiles"
-        self.downloads_dir = self.data_dir / "downloads"
+        # Archives live in <WMM root>\downloads (next to data/), never inside data/.
+        self.downloads_dir = self.data_dir.parent / "downloads"
+        self.tmp_dir = self.data_dir / "tmp"
         self.backup_dir = self.data_dir / "backup"
         self.logs_dir = self.data_dir / "logs"
         self.settings_path = self.data_dir / "settings.json"
@@ -123,8 +125,15 @@ class Store:
         self.ensure_dirs()
 
     def ensure_dirs(self) -> None:
-        for d in (self.data_dir, self.mods_dir, self.profiles_dir, self.downloads_dir, self.backup_dir, self.logs_dir):
+        for d in (self.data_dir, self.mods_dir, self.profiles_dir, self.backup_dir, self.logs_dir):
             d.mkdir(parents=True, exist_ok=True)
+
+    def new_tmp_dir(self, prefix: str = "wmm_ext_") -> Path:
+        """Fresh scratch dir under data/tmp (created on demand, same drive as data/mods so moves are renames)."""
+        import tempfile
+
+        self.tmp_dir.mkdir(parents=True, exist_ok=True)
+        return Path(tempfile.mkdtemp(prefix=prefix, dir=str(self.tmp_dir)))
 
     # --- Settings ---
 

@@ -232,3 +232,25 @@ class TestManualDownloadName(unittest.TestCase):
         )
         self.assertIsNone(parse_nexus_archive_name("MyHandmade_P.zip"))
         self.assertIsNone(parse_nexus_archive_name("Some Mod v2.zip"))
+
+
+class TestRankUpdateTargets(unittest.TestCase):
+    def test_same_nexus_id_closest_file_name_first(self) -> None:
+        from wmm.nexus import rank_update_targets
+        from wmm.store import ModRecord
+
+        def rec(i, name, src, nid):
+            return ModRecord(id=i, name=name, version="1", badge="PAK", source=src, nexus_mod_id=nid, components=[])
+
+        mods = [
+            rec("Weapons Swing Enhanced", "Weapons Swing Enhanced", "x/Weapons Swing Enhanced 25-233-2-00-1759743396.7z", 233),
+            rec("Player Movement Tweaks", "Player Movement Tweaks", "x/Weapons Swing Enhanced 25-233-2-00-1759743396.7z", 233),
+            rec("Other", "Other Mod", "x/Other-9-1-0-1.zip", 9),
+        ]
+        got = rank_update_targets(
+            "Player Movement Tweaks-233-3-10-1758644724.7z", mods, lambda m: m.nexus_mod_id, 233
+        )
+        self.assertEqual([m.id for m in got][0], "Player Movement Tweaks")
+        self.assertEqual(len(got), 2)
+        got2 = rank_update_targets("Weapons Swing Enhanced 25-233-2-00-1759743396.7z", mods, lambda m: m.nexus_mod_id, 233)
+        self.assertEqual(got2[0].id, "Weapons Swing Enhanced")

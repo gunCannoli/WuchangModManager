@@ -46,6 +46,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from ..applog import AppLog, LogEntry
 from ..base import detect_mod_base
 from ..cli import NXM_IPC_SERVER_NAME
 from ..deploy import DeployError, Manager, UnmanagedMod, scan_unmanaged_mods
@@ -61,6 +62,7 @@ from ..nexus import (
     parse_nxm_uri,
     is_update_available,
     latest_main_file,
+    rank_update_targets,
     update_mod_preserving_configs,
     version_key,
 )
@@ -375,15 +377,68 @@ class _ResponsiveTable(QTableWidget):
 
 
 class LogDialog(QDialog):
-    def __init__(self, log_lines: list[str], title: str, parent: Optional[QWidget] = None):
+    """Log viewer: one row per event (Time | Level | Event); right-click copies a line or the whole log."""
+
+    def __init__(
+        self,
+        entries: list[LogEntry],
+        title: str,
+        parent: Optional[QWidget] = None,
+        translator: Optional[Translator] = None,
+    ):
         super().__init__(parent)
+        self._entries = list(entries)
+        self._tr = translator.tr if translator is not None else (lambda k, **kw: k)
         self.setWindowTitle(title)
-        self.resize(680, 380)
+        self.resize(900, 460)
         lay = QVBoxLayout(self)
-        self.view = QPlainTextEdit()
-        self.view.setReadOnly(True)
-        self.view.setPlainText("\n".join(log_lines))
+        self.view = QTableWidget(len(self._entries), 3)
+        self.view.setHorizontalHeaderLabels(
+            [self._tr("log.col.time"), self._tr("log.col.level"), self._tr("log.col.event")]
+        )
+        self.view.verticalHeader().setVisible(False)
+        self.view.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.view.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self.view.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.view.setShowGrid(False)
+        self.view.setWordWrap(True)
+        hh = self.view.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        for r, e in enumerate(self._entries):
+            self.view.setItem(r, 0, QTableWidgetItem(e.stamp))
+            lvl = QTableWidgetItem(e.level)
+            if e.level in ("ERROR", "WARN"):
+                lvl.setForeground(QColor("#E5646E" if e.level == "ERROR" else "#E0B050"))
+            self.view.setItem(r, 1, lvl)
+            self.view.setItem(r, 2, QTableWidgetItem(e.message))
+        self.view.resizeRowsToContents()
+        self.view.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.view.customContextMenuRequested.connect(self._on_menu)
         lay.addWidget(self.view)
+        if self._entries:
+            self.view.scrollToBottom()
+
+    def _selected_rows(self) -> list[int]:
+        return sorted({i.row() for i in self.view.selectedIndexes()})
+
+    def _on_menu(self, pos) -> None:
+        row = self.view.rowAt(pos.y())
+        if row >= 0 and row not in self._selected_rows():
+            self.view.selectRow(row)
+        menu = QMenu(self)
+        rows = self._selected_rows()
+        if rows:
+            act = QAction(self._tr("log.copy_line"), self)
+            act.triggered.connect(
+                lambda: QApplication.clipboard().setText("\n".join(self._entries[r].line() for r in rows))
+            )
+            menu.addAction(act)
+        act_all = QAction(self._tr("log.copy_all"), self)
+        act_all.triggered.connect(lambda: QApplication.clipboard().setText("\n".join(e.line() for e in self._entries)))
+        menu.addAction(act_all)
+        menu.exec(self.view.viewport().mapToGlobal(pos))
 
 
 class _GameLockDialog(QDialog):
@@ -448,7 +503,8 @@ class MainWindow(QMainWindow):
         self.t = Translator(self.package_root / "lang", language=settings.get("language", "en"))
 
         self.game: Optional[GameInstall] = self._resolve_game(game_override)
-        self.logs: list[str] = []
+        self.applog = AppLog(self.store.logs_dir / "wmm.log")
+        self._install_excepthook()
         self.conflict_report: Optional[PakConflictReport] = None
         self.unmanaged_mods: dict[str, UnmanagedMod] = {}
         self._active_downloads: list[_DownloadWorker] = []
@@ -590,8 +646,23 @@ class MainWindow(QMainWindow):
                 self.t.tr("lock.restart_required"),
             )
 
-    def _log(self, msg: str) -> None:
-        self.logs.append(msg)
+    def _log(self, msg: str, level: str = "INFO") -> None:
+        self.applog.add(msg, level)
+
+    def _install_excepthook(self) -> None:
+        """Route uncaught exceptions in Qt slots into the log instead of failing silently."""
+        import traceback
+
+        prev = sys.excepthook
+
+        def hook(exc_type, exc, tb) -> None:
+            try:
+                self._log("Unhandled error: " + "".join(traceback.format_exception(exc_type, exc, tb)).strip(), "ERROR")
+            except Exception:  # noqa: BLE001
+                pass
+            prev(exc_type, exc, tb)
+
+        sys.excepthook = hook
 
     def _resolve_game(self, override: Optional[Path]) -> Optional[GameInstall]:
         if override is not None:
@@ -613,6 +684,7 @@ class MainWindow(QMainWindow):
             platform=self.plat,
             tools_dir=self.package_root / "tools",
             allow_while_running=self._game_unlocked,
+            log=self._log,
         )
 
     # --- UI construction ---
@@ -1959,17 +2031,22 @@ class MainWindow(QMainWindow):
                 f"Path: {u.path}",
                 f"Folder: {u.folder}",
             ]
-            LogDialog(lines, u.name, parent=self).exec()
+            QMessageBox.information(self, u.name, "\n".join(lines))
             return
         mod = self.store.load_mod(mod_id)
         if mod is None:
             return
-        manifest = [e for e in self.store.load_manifest() if e.mod_id == mod_id]
+        full_manifest = self.store.load_manifest()
+        manifest = [e for e in full_manifest if e.mod_id == mod_id]
+        names = {m.id: m.name for m in self.store.list_mods()}
+        pak_owner = {e.deployed_name: names.get(e.mod_id, e.mod_id) for e in full_manifest if e.kind.startswith("pak_")}
         ModDetailsDialog(
             mod,
             manifest,
             self.conflict_report,
             self.t,
+            store_dir=self.store.mod_dir(mod_id),
+            pak_owner=pak_owner,
             on_visit_nexus=self._visit_nexus_page,
             on_endorse_nexus=self._endorse_nexus_mod,
             on_rename=lambda new: self._rename_mod(mod_id, new),
@@ -2006,61 +2083,66 @@ class MainWindow(QMainWindow):
         if ok and want_on:
             self._notify_restart_if_game_running()
 
-    def _prompt_update_existing(
+    def _prompt_update_target(
         self,
-        existing: ModRecord,
+        archive: Path,
+        candidates: list[ModRecord],
         nexus_id: Optional[int],
-        allow_separate: bool = True,
-    ) -> tuple[str, bool]:
-        """Ask user whether to update existing mod on top, with a config-backup checkbox.
+        preferred_id: Optional[str] = None,
+    ) -> tuple[str, Optional[str], bool]:
+        """Ask which installed mod this archive overrides, or whether to install it as a new mod.
 
-        Returns (action, backup_configs) where action is 'update', 'separate', or 'cancel'.
+        One dropdown: every installed mod with the same Nexus id / a similar name (closest file name first,
+        or `preferred_id` first), then "Install as a new mod". Returns (action, mod_id, backup_configs) with
+        action 'update', 'separate' or 'cancel'.
         """
+        if preferred_id is not None:
+            candidates = sorted(candidates, key=lambda m: m.id != preferred_id)
         dlg = QDialog(self)
         dlg.setWindowTitle(self.t.tr("update.title"))
-        dlg.setMinimumWidth(420)
+        dlg.setMinimumWidth(520)
         lay = QVBoxLayout(dlg)
         lay.setSpacing(10)
 
-        nid_str = str(nexus_id) if nexus_id is not None else "-"
         lbl = QLabel(
-            self.t.tr(
-                "update.confirm_body",
-                name=existing.name,
-                id=nid_str,
-                version=existing.version or "-",
-            )
+            self.t.tr("update.pick_body", file=archive.name, id=str(nexus_id) if nexus_id is not None else "-")
         )
         lbl.setWordWrap(True)
         lay.addWidget(lbl)
 
+        combo = QComboBox()
+        for m in candidates:
+            combo.addItem(
+                self.t.tr("update.opt_override", name=m.name, version=m.version or "-"), m.id
+            )
+        combo.addItem(self.t.tr("update.opt_new"), None)
+        lay.addWidget(combo)
+
         chk_bak = QCheckBox(self.t.tr("update.backup_configs"))
         chk_bak.setChecked(True)
         lay.addWidget(chk_bak)
+        combo.currentIndexChanged.connect(lambda _i: chk_bak.setEnabled(combo.currentData() is not None))
 
-        result = {"action": "cancel"}
         footer = QHBoxLayout()
         footer.addStretch(1)
-
         btn_cancel = QPushButton(self.t.tr("btn.cancel"))
         btn_cancel.setFixedWidth(84)
         btn_cancel.clicked.connect(dlg.reject)
         footer.addWidget(btn_cancel)
-
-        if allow_separate:
-            btn_sep = QPushButton(self.t.tr("update.install_separate"))
-            btn_sep.clicked.connect(lambda: (result.__setitem__("action", "separate"), dlg.accept()))
-            footer.addWidget(btn_sep)
-
-        btn_upd = QPushButton(self.t.tr("btn.update"))
-        btn_upd.setFixedWidth(84)
-        btn_upd.setProperty("accent", True)
-        btn_upd.clicked.connect(lambda: (result.__setitem__("action", "update"), dlg.accept()))
-        footer.addWidget(btn_upd)
-
+        btn_ok = QPushButton(self.t.tr("btn.ok"))
+        btn_ok.setFixedWidth(84)
+        btn_ok.setProperty("accent", True)
+        btn_ok.setDefault(True)
+        btn_ok.clicked.connect(dlg.accept)
+        footer.addWidget(btn_ok)
         lay.addLayout(footer)
-        dlg.exec()
-        return result["action"], chk_bak.isChecked()
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return "cancel", None, False
+        target = combo.currentData()
+        if target is None:
+            return "separate", None, False
+        return "update", str(target), chk_bak.isChecked()
 
     def _install_path(
         self,
@@ -2068,6 +2150,7 @@ class MainWindow(QMainWindow):
         name: Optional[str] = None,
         version: str = "",
         nexus_mod_id: Optional[int] = None,
+        skip_prompt: bool = False,
     ) -> None:
         mgr = self._manager()
         if mgr is None:
@@ -2078,38 +2161,39 @@ class MainWindow(QMainWindow):
         parsed_nx = parse_nexus_archive_name(path.name)
         if parsed_nx is not None and not version:
             version = parsed_nx[2]
-        if resolved_nid is not None:
-            existing = next(
-                (m for m in self.store.list_mods() if self._resolve_nexus_mod_id(m) == resolved_nid),
-                None,
-            )
-            if existing is not None:
-                action, backup_cfgs = self._prompt_update_existing(existing, resolved_nid, allow_separate=True)
-                if action == "cancel":
-                    return
-                if action == "update":
-                    try:
-                        rec, summaries = update_mod_preserving_configs(
-                            mgr,
-                            existing.id,
-                            path,
-                            new_version=version,
-                            backup_configs=backup_cfgs,
-                            nexus_mod_id=resolved_nid,
-                        )
-                        self._log(
-                            f"Updated {rec.name} (preserved {len(summaries)} config.lua"
-                            f"{', backed up configs' if backup_cfgs else ''})"
-                        )
-                    except Exception as exc:
-                        QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
-                    self.refresh_all()
-                    return
+        candidates = [] if skip_prompt else rank_update_targets(
+            path.name, self.store.list_mods(), self._resolve_nexus_mod_id, resolved_nid
+        )
+        if candidates:
+            action, target_id, backup_cfgs = self._prompt_update_target(path, candidates, resolved_nid)
+            if action == "cancel":
+                return
+            if action == "update" and target_id:
+                try:
+                    rec, summaries = update_mod_preserving_configs(
+                        mgr,
+                        target_id,
+                        path,
+                        new_version=version,
+                        backup_configs=backup_cfgs,
+                        nexus_mod_id=resolved_nid,
+                    )
+                    self._log(
+                        f"Updated {rec.name} from {path.name} (version {rec.version or '-'}, preserved "
+                        f"{len(summaries)} config.lua{', backed up configs' if backup_cfgs else ''})"
+                    )
+                except Exception as exc:  # noqa: BLE001
+                    self._log(f"Update of {target_id} from {path.name} failed: {exc}", "ERROR")
+                    QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+                self.refresh_all()
+                return
 
+        self._log(f"Installing {path}")
         try:
             rec = mgr.add_mod(path, name=name, version=version, nexus_mod_id=resolved_nid)
             self._log(f"Added {rec.name} ({rec.id}) [{rec.badge}]")
         except DeployError as exc:
+            self._log(f"Install of {path.name} failed: {exc}", "ERROR")
             if "loader DLL" in str(exc):
                 ans = QMessageBox.question(self, self.t.tr("app.title"), str(exc))
                 if ans == QMessageBox.StandardButton.Yes:
@@ -2120,7 +2204,13 @@ class MainWindow(QMainWindow):
             else:
                 QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
         except ExtractError as exc:
+            self._log(f"Extraction of {path.name} failed: {exc}", "ERROR")
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))
+        except Exception as exc:  # noqa: BLE001 - any other failure must reach the user and the log
+            import traceback
+
+            self._log(f"Install of {path.name} crashed: {traceback.format_exc().strip()}", "ERROR")
+            QMessageBox.warning(self, self.t.tr("app.title"), f"{path.name}: {type(exc).__name__}: {exc}")
         self.refresh_all()
 
     def _on_add(self) -> None:
@@ -2176,16 +2266,19 @@ class MainWindow(QMainWindow):
                 self._active_downloads.remove(worker)
             dl_path = Path(dl_path_str)
             self._log(f"Downloaded: {dl_path.name}")
-            if auto_extract:
-                self._install_path(dl_path, name=mod_name, version=mod_ver, nexus_mod_id=nx_mod_id)
-            else:
-                self.refresh_all()
+            # Show the finished file (and drop the 100% bar) before any modal install prompt blocks the event loop.
             self.right_tabs.setCurrentWidget(self.tab_downloads)
+            self.refresh_all()
+            if auto_extract:
+                QTimer.singleShot(
+                    0, lambda: self._install_path(dl_path, name=mod_name, version=mod_ver, nexus_mod_id=nx_mod_id)
+                )
 
         def _on_fail(did: int, err_msg: str) -> None:
             self._dl_progress.pop(did, None)
             if worker in self._active_downloads:
                 self._active_downloads.remove(worker)
+            self._log(f"Download failed: {err_msg}", "ERROR")
             self.refresh_all()
             QMessageBox.warning(self, self.t.tr("app.title"), err_msg)
 
@@ -2292,7 +2385,7 @@ class MainWindow(QMainWindow):
             self.game = dlg.game
 
     def _on_show_log(self) -> None:
-        dlg = LogDialog(self.logs or ["(no log entries yet)"], self.t.tr("btn.log"), parent=self)
+        dlg = LogDialog(self.applog.entries, self.t.tr("btn.log"), parent=self, translator=self.t)
         dlg.exec()
 
     # --- Context menu (Open folder, Move up/down, Update, Uninstall) ---
@@ -2399,18 +2492,24 @@ class MainWindow(QMainWindow):
         )
         if not chosen:
             return
-        action, backup_cfgs = self._prompt_update_existing(
-            existing, self._resolve_nexus_mod_id(existing), allow_separate=False
-        )
-        if action != "update":
+        arc = Path(chosen)
+        nid = self._resolve_nexus_mod_id(existing)
+        cands = rank_update_targets(arc.name, self.store.list_mods(), self._resolve_nexus_mod_id, nid)
+        if all(c.id != existing.id for c in cands):
+            cands.append(existing)
+        action, target_id, backup_cfgs = self._prompt_update_target(arc, cands, nid, preferred_id=existing.id)
+        if action == "separate":
+            self._install_path(arc, skip_prompt=True)
+            return
+        if action != "update" or not target_id:
             return
         try:
             rec, summaries = update_mod_preserving_configs(
-                mgr, mod_id, Path(chosen), backup_configs=backup_cfgs
+                mgr, target_id, arc, backup_configs=backup_cfgs
             )
             self._log(
-                f"Updated {rec.name} (preserved {len(summaries)} config.lua"
-                f"{', backed up configs' if backup_cfgs else ''})"
+                f"Updated {rec.name} from {arc.name} (version {rec.version or '-'}, preserved "
+                f"{len(summaries)} config.lua{', backed up configs' if backup_cfgs else ''})"
             )
         except Exception as exc:
             QMessageBox.warning(self, self.t.tr("app.title"), str(exc))

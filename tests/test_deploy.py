@@ -172,3 +172,36 @@ class TestDeploy(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class StoreLayoutTests(unittest.TestCase):
+    def test_no_data_downloads_and_tmp_on_demand(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from wmm.store import Store
+
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            store = Store(root / "data")
+            self.assertFalse((root / "data" / "downloads").exists())
+            self.assertEqual(store.downloads_dir, root / "downloads")
+            self.assertFalse(store.tmp_dir.exists())
+            t = store.new_tmp_dir()
+            self.assertTrue(t.is_dir() and t.parent == store.tmp_dir)
+
+
+class AppLogTests(unittest.TestCase):
+    def test_entries_timestamped_and_persisted(self) -> None:
+        import tempfile
+        from pathlib import Path
+
+        from wmm.applog import AppLog
+
+        with tempfile.TemporaryDirectory() as td:
+            log = AppLog(Path(td) / "logs" / "wmm.log")
+            log.add("hello")
+            log.add("boom", "error")
+            self.assertEqual([e.level for e in log.entries], ["INFO", "ERROR"])
+            self.assertRegex(log.entries[0].line(), r"^\d{4}-\d\d-\d\d \d\d:\d\d:\d\d  INFO   hello$")
+            self.assertEqual(len((Path(td) / "logs" / "wmm.log").read_text(encoding="utf-8").splitlines()), 2)
